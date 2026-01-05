@@ -28,7 +28,7 @@ group: webusers
 | ca_file | The path to the root CA file | string |
 | s2n_config_cache_size | The maximum number of unique s2n configs to cache. A value of 0 disables the cache. Default: 10 (s2n-tls only) | number |
 | work_stealing | Enable work stealing runtime (default true). See Pingora runtime (WIP) section for more info | bool |
-| upstream_keepalive_pool_size | The number of total connections to keep in the connection pool | number |
+| upstream_keepalive_pool_size | The number of idle upstream connections to keep per tokio worker. The pool's effective ceiling is `upstream_keepalive_pool_size × threads`. Eviction is globally consistent across workers. | number |
 
 ## Extension
 Any unknown settings will be ignored. This allows extending the conf file to add and pass user defined settings. See User defined configuration section.
