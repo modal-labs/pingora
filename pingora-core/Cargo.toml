@@ -29,7 +29,7 @@ pingora-http = { version = "0.8.0", path = "../pingora-http" }
 pingora-rustls = { version = "0.8.0", path = "../pingora-rustls", optional = true }
 pingora-s2n = { version = "0.8.0", path = "../pingora-s2n", optional = true }
 bstr = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }

@@ -30,6 +30,7 @@ use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
+use crate::protocols::http::body_fork::{body_fork_pair, BodyForkReceiver, BodyForkSender};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
@@ -109,6 +110,8 @@ pub struct HttpSession {
     pub write_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
+    /// Optional lossy tee of request body bytes (see [`Self::attach_request_body_fork`]).
+    body_fork: Option<BodyForkSender>,
 }
 
 impl HttpSession {
@@ -150,6 +153,7 @@ impl HttpSession {
                 digest,
                 write_timeout: None,
                 total_drain_timeout: None,
+                body_fork: None,
             }
         }))
     }
@@ -173,21 +177,42 @@ impl HttpSession {
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
-            ErrorType::ReadError,
-            "while reading downstream request body",
-        )?;
-        if let Some(data) = data.as_ref() {
-            self.body_read += data.len();
-            if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(data);
+        match self
+            .request_body_reader
+            .data()
+            .await
+            .transpose()
+            .or_err(
+                ErrorType::ReadError,
+                "while reading downstream request body",
+            ) {
+            Ok(Some(ref data)) => {
+                self.body_read += data.len();
+                if let Some(buffer) = self.retry_buffer.as_mut() {
+                    buffer.write_to_buffer(data);
+                }
+                if let Some(ref tx) = self.body_fork {
+                    if tx.try_push(data.clone()).is_err() {
+                        self.body_fork = None; // abort: drop sender
+                    }
+                }
+                let _ = self
+                    .request_body_reader
+                    .flow_control()
+                    .release_capacity(data.len());
+                Ok(Some(data.clone()))
             }
-            let _ = self
-                .request_body_reader
-                .flow_control()
-                .release_capacity(data.len());
+            Ok(None) => {
+                if let Some(tx) = self.body_fork.take() {
+                    tx.finish(); // clean EOF: preserve buffered bytes
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                self.body_fork = None; // abort: drop clears buffered bytes
+                Err(e)
+            }
         }
-        Ok(data)
     }
 
     #[doc(hidden)]
@@ -220,6 +245,19 @@ impl HttpSession {
             }
         }
     }
+
+    /// Attach a bounded lossy fork of the request body. Returns [`None`] if a fork is already
+    /// attached. Call before the first [`Self::read_body_bytes`]. See
+    /// [`crate::protocols::http::v1::server::HttpSession::attach_request_body_fork`] for semantics.
+    pub fn attach_request_body_fork(&mut self, max_chunks: usize) -> Option<BodyForkReceiver> {
+        if self.body_fork.is_some() {
+            return None;
+        }
+        let (tx, rx) = body_fork_pair(max_chunks);
+        self.body_fork = Some(tx);
+        Some(rx)
+    }
+
 
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     // NOTE for h2 it may be worth allowing cancellation of the stream via reset.

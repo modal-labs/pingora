@@ -61,6 +61,7 @@ use pingora_core::connectors::http::custom;
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
+use pingora_core::protocols::http::body_fork::BodyForkReceiver;
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
@@ -1094,6 +1095,51 @@ impl SubrequestSpawner {
                 .process_subrequest(Box::new(session), sub_req_ctx)
                 .await;
         })
+    }
+
+    /// Spawn a mirror subrequest fed by a [`BodyForkReceiver`].
+    ///
+    /// Clones the request headers from `session`, wires `body_rx` into the subrequest's
+    /// body channel, and runs the subrequest through the full proxy pipeline in the
+    /// background. Responses from the mirror are drained and discarded.
+    ///
+    /// `user_ctx` is stored on the subrequest's [`Ctx`] and can be retrieved via
+    /// [`Ctx::user_ctx`] in proxy callbacks (e.g. `upstream_peer`).
+    pub fn spawn_mirror_subrequest(
+        &self,
+        session: &HttpSession,
+        mut body_rx: BodyForkReceiver,
+        user_ctx: Option<subrequest::UserCtx>,
+    ) {
+        let mut ctx_builder = SubrequestCtx::builder().body_mode(BodyMode::ExpectBody);
+        if let Some(uctx) = user_ctx {
+            ctx_builder = ctx_builder.user_ctx(uctx);
+        }
+        let ctx = ctx_builder.build();
+        let (prepared, handle) = self.create_subrequest(session, ctx);
+        let SubrequestHandle { tx, mut rx, .. } = handle;
+
+        // Drain mirror responses — we don't need them.
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        tokio::spawn(async move {
+            // Feed forked body bytes into the subrequest.
+            while let Some(chunks) = body_rx.recv().await {
+                for chunk in chunks {
+                    if tx.send(HttpTask::Body(Some(chunk), false)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(HttpTask::Body(None, true)).await;
+
+            // Keep tx alive until the subrequest pipeline finishes (signaled
+            // by the drain task completing when the pipeline drops its sender).
+            let _ = drain.await;
+        });
+
+        // Run the subrequest through the proxy pipeline.
+        tokio::spawn(async move { prepared.run().await });
     }
 
     /// Create a subrequest that listens to `HttpTask`s sent from the returned `Sender`

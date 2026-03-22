@@ -32,7 +32,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask};
+use crate::protocols::http::{
+    body_buffer::FixedBuffer,
+    body_fork::{body_fork_pair, BodyForkReceiver, BodyForkSender},
+    date, HttpTask,
+};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -86,6 +90,8 @@ pub struct HttpSession {
     /// Number of times the upstream connection associated with this session can be reused
     /// after this session ends
     keepalive_reuses_remaining: Option<u32>,
+    /// Optional lossy tee of request body bytes (see [`Self::attach_request_body_fork`]).
+    body_fork: Option<BodyForkSender>,
 }
 
 impl HttpSession {
@@ -126,6 +132,7 @@ impl HttpSession {
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
             keepalive_reuses_remaining: None,
+            body_fork: None,
         }
     }
 
@@ -424,16 +431,47 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body().await?;
-        Ok(read.map(|b| {
-            let bytes = Bytes::copy_from_slice(self.get_body(&b));
-            self.body_bytes_read += bytes.len();
-            if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(&bytes);
+        let read = self.read_body().await;
+        match read {
+            Ok(Some(b)) => {
+                let bytes = Bytes::copy_from_slice(self.get_body(&b));
+                self.body_bytes_read += bytes.len();
+                if let Some(buffer) = self.retry_buffer.as_mut() {
+                    buffer.write_to_buffer(&bytes);
+                }
+                if let Some(ref tx) = self.body_fork {
+                    if tx.try_push(bytes.clone()).is_err() {
+                        self.body_fork = None; // abort: drop sender
+                    }
+                }
+                Ok(Some(bytes))
             }
-            bytes
-        }))
+            Ok(None) => {
+                if let Some(tx) = self.body_fork.take() {
+                    tx.finish(); // clean EOF: preserve buffered bytes
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                self.body_fork = None; // abort: drop clears buffered bytes
+                Err(e)
+            }
+        }
     }
+
+    /// Attach a bounded lossy fork of the request body. Returns [`None`] if a fork is already
+    /// attached. Call before the first [`Self::read_body_bytes`]. Up to `max_chunks` chunks
+    /// are queued; if [`BodyForkSender::try_push`] would exceed that, the fork sender is dropped
+    /// and the receiver stops after draining queued data.
+    pub fn attach_request_body_fork(&mut self, max_chunks: usize) -> Option<BodyForkReceiver> {
+        if self.body_fork.is_some() {
+            return None;
+        }
+        let (tx, rx) = body_fork_pair(max_chunks);
+        self.body_fork = Some(tx);
+        Some(rx)
+    }
+
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
         self.init_body_reader();

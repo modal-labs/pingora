@@ -14,6 +14,7 @@
 
 //! HTTP server session APIs
 
+use super::body_fork::BodyForkReceiver;
 use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
@@ -585,6 +586,18 @@ impl Session {
             Self::H2(s) => s.enable_retry_buffering(),
             Self::Subrequest(s) => s.enable_retry_buffering(),
             Self::Custom(s) => s.enable_retry_buffering(),
+        }
+    }
+
+    /// Attach a bounded lossy fork of the downstream request body (HTTP/1 and HTTP/2 only).
+    ///
+    /// Returns [`None`] for subrequest/custom sessions or if a fork is already attached on the
+    /// underlying session. See [`SessionV1::attach_request_body_fork`].
+    pub fn attach_request_body_fork(&mut self, max_chunks: usize) -> Option<BodyForkReceiver> {
+        match self {
+            Self::H1(s) => s.attach_request_body_fork(max_chunks),
+            Self::H2(s) => s.attach_request_body_fork(max_chunks),
+            Self::Subrequest(_) | Self::Custom(_) => None,
         }
     }
 

@@ -15,6 +15,7 @@
 //! HTTP/1.x and HTTP/2 implementation APIs
 
 pub mod body_buffer;
+pub mod body_fork;
 pub mod bridge;
 pub mod client;
 pub mod compression;
@@ -27,6 +28,9 @@ pub mod subrequest;
 pub mod v1;
 pub mod v2;
 
+pub use body_fork::{
+    body_fork_pair, BodyForkPushError, BodyForkReceiver, BodyForkSender,
+};
 pub use server::Session as ServerSession;
 
 /// The Pingora server name string
