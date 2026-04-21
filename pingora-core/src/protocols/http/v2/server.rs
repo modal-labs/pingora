@@ -527,10 +527,38 @@ impl HttpSession {
         self.send_response_body.take()
     }
 
-    // This is a hack for pingora-proxy to create subrequests from h2 server session
-    // TODO: be able to convert from h2 to h1 subrequest
+    /// Serialize the H2 request header as HTTP/1.1 wire bytes for subrequest
+    /// use.  Applies the same H2→H1 conversions as `proxy_h1.rs`:
+    ///
+    /// 1. Force version to HTTP/1.1 (H1 parser rejects "HTTP/2")
+    /// 2. Add `Host` header from `:authority` if absent (H2 uses `:authority`,
+    ///    most H1 servers expect `Host`)
+    /// 3. Add `Transfer-Encoding: chunked` if there is a body but no
+    ///    `Content-Length` (H2 uses its own framing; H1 needs an explicit
+    ///    body-length signal)
     pub fn pseudo_raw_h1_request_header(&self) -> Bytes {
-        let buf = http_req_header_to_wire(&self.request_header).unwrap(); // safe, None only when version unknown
+        let mut header = self.request_header.clone();
+        header.set_version(http::Version::HTTP_11);
+
+        // H2 uses :authority instead of Host; add Host for H1 compatibility.
+        if !header.headers.contains_key(http::header::HOST) {
+            let host = header.uri.authority().map_or("", |a| a.as_str()).to_owned();
+            header
+                .insert_header(http::header::HOST, host)
+                .expect("valid host header");
+        }
+
+        // H2 has its own framing; H1 needs Content-Length or chunked encoding.
+        if self.body_read == 0
+            && !self.is_body_empty()
+            && !header.headers.contains_key(http::header::CONTENT_LENGTH)
+        {
+            header
+                .insert_header(http::header::TRANSFER_ENCODING, "chunked")
+                .expect("valid TE header");
+        }
+
+        let buf = http_req_header_to_wire(&header).unwrap(); // safe, None only when version unknown
         buf.freeze()
     }
 
