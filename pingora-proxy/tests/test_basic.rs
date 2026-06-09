@@ -21,8 +21,11 @@ use hyper::{body::HttpBody, header::HeaderValue, Body, Client};
 #[cfg(unix)]
 use hyperlocal::{UnixClientExt, Uri};
 use reqwest::{header, StatusCode};
+use std::future::poll_fn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio::time::{timeout, Duration};
 
 use utils::server_utils::init;
 
@@ -177,6 +180,170 @@ async fn test_h2c_to_h2c() {
 
     let body = res.into_body().data().await.unwrap().unwrap();
     assert_eq!(body.as_ref(), b"Hello World!\n");
+}
+
+const H2C_PROXY_ADDR: &str = "127.0.0.1:6146";
+const H2_BODY_CHUNK_SIZE: usize = 16 * 1024;
+const DEFAULT_H2_STREAM_WINDOW: usize = 65_535;
+const DOWNSTREAM_RST_OBSERVATION_WINDOW: Duration = Duration::from_millis(200);
+
+struct StallingH2Origin {
+    port: u16,
+    upstream_window_full_rx: oneshot::Receiver<()>,
+    upstream_reset_rx: oneshot::Receiver<()>,
+    shutdown_tx: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_stalling_h2_origin() -> StallingH2Origin {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let (upstream_window_full_tx, upstream_window_full_rx) = oneshot::channel();
+    let (upstream_reset_tx, upstream_reset_rx) = oneshot::channel();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(stream).await.unwrap();
+        let Some(request) = conn.accept().await else {
+            return;
+        };
+        let (request, _send_response) = request.unwrap();
+        let mut body = request.into_body();
+        let mut bytes_read = 0;
+        let mut upstream_window_full_tx = Some(upstream_window_full_tx);
+        let mut upstream_reset_tx = Some(upstream_reset_tx);
+
+        loop {
+            tokio::select! {
+                data = body.data() => {
+                    match data {
+                        Some(Ok(data)) => {
+                            bytes_read += data.len();
+                            if bytes_read >= DEFAULT_H2_STREAM_WINDOW {
+                                if let Some(tx) = upstream_window_full_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                            }
+                            // Intentionally do not release flow-control capacity.
+                        }
+                        Some(Err(_)) => {
+                            if let Some(tx) = upstream_reset_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            return;
+                        }
+                        None => return,
+                    }
+                }
+                _ = &mut shutdown_rx => return,
+            }
+        }
+    });
+
+    StallingH2Origin {
+        port,
+        upstream_window_full_rx,
+        upstream_reset_rx,
+        shutdown_tx,
+        handle,
+    }
+}
+
+async fn send_downstream_reset_after_upstream_write_stalls(origin: StallingH2Origin, path: &str) {
+    let StallingH2Origin {
+        port,
+        mut upstream_window_full_rx,
+        mut upstream_reset_rx,
+        shutdown_tx,
+        handle,
+    } = origin;
+
+    let tcp = TcpStream::connect(H2C_PROXY_ADDR).await.unwrap();
+    let (mut client, connection) = client::handshake(tcp).await.unwrap();
+    let connection_handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("http://{H2C_PROXY_ADDR}{path}"))
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .body(())
+        .unwrap();
+    let (_response, mut body) = client.send_request(request, false).unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            body.reserve_capacity(H2_BODY_CHUNK_SIZE);
+            tokio::select! {
+                result = &mut upstream_window_full_rx => {
+                    result.unwrap();
+                    break;
+                }
+                capacity = poll_fn(|cx| body.poll_capacity(cx)) => {
+                    let capacity = capacity
+                        .expect("downstream request body stream closed")
+                        .expect("downstream request body capacity error");
+                    let len = capacity.min(H2_BODY_CHUNK_SIZE);
+                    if len > 0 {
+                        body.send_data(Bytes::from(vec![b'a'; len]), false).unwrap();
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("upstream h2 receive window did not fill");
+
+    body.send_reset(h2::Reason::CANCEL);
+
+    assert!(
+        timeout(DOWNSTREAM_RST_OBSERVATION_WINDOW, &mut upstream_reset_rx)
+            .await
+            .is_err(),
+        "upstream saw a reset immediately after downstream RST_STREAM"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = timeout(Duration::from_secs(1), handle).await;
+    drop(body);
+    drop(client);
+    let _ = timeout(Duration::from_secs(1), connection_handle).await;
+}
+
+#[tokio::test]
+async fn test_h2_downstream_reset_while_blocked_sending_upstream_body() {
+    init();
+
+    let origin = spawn_stalling_h2_origin().await;
+    send_downstream_reset_after_upstream_write_stalls(origin, "/blocked-h2-upstream").await;
+}
+
+#[tokio::test]
+async fn test_h2_downstream_reset_while_blocked_sending_upstream_body_under_load() {
+    init();
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let origin = spawn_stalling_h2_origin().await;
+        handles.push(tokio::spawn(async move {
+            send_downstream_reset_after_upstream_write_stalls(
+                origin,
+                &format!("/blocked-h2-upstream-load-{i}"),
+            )
+            .await;
+        }));
+    }
+
+    for handle in handles {
+        timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("load repro task timed out")
+            .unwrap();
+    }
 }
 
 #[tokio::test]

@@ -371,8 +371,15 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
+                    let body_len = body.as_ref().map_or(0, Bytes::len);
+                    debug!(
+                        "forwarding h2 downstream body to upstream: bytes={body_len}, end_of_body={is_body_done}"
+                    );
                     match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
+                            debug!(
+                                "forwarded h2 downstream body to upstream: bytes={body_len}, request_done={request_done}"
+                            );
                             downstream_state.maybe_finished(request_done);
                         },
                         Err(e) => {
