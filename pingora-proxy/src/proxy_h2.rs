@@ -347,10 +347,25 @@ where
             tokio::select! {
                 // NOTE: cannot avoid this copy since h2 owns the buf
                 body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
-                    debug!("downstream event");
+                    warn!(
+                        "repro: downstream arm selected; about to read body/result, {}",
+                        self.inner.request_summary(session, ctx)
+                    );
                     let body = match body {
-                        Ok(b) => b,
+                        Ok(b) => {
+                            // warn!(
+                            //     "repro: downstream read returned body={} end_done={}, {}",
+                            //     b.as_ref().map_or(0, |bytes| bytes.len()),
+                            //     session.is_body_done(),
+                            //     self.inner.request_summary(session, ctx)
+                            // );
+                            b
+                        },
                         Err(e) => {
+                            warn!(
+                                "repro: downstream read observed error before upstream write await returned: {e}, {}",
+                                self.inner.request_summary(session, ctx)
+                            );
                             let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
                                 || serve_from_cache.is_miss();
                             if wait_for_cache_fill {
@@ -371,13 +386,21 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
+                    // warn!(
+                    //     "repro: entering send_body_to2 await end_of_body={is_body_done}, {}",
+                    //     self.inner.request_summary(session, ctx)
+                    // );
                     match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
                         Ok(request_done) =>  {
+                            warn!(
+                                "repro: send_body_to2 returned Ok request_done={request_done}, {}",
+                                self.inner.request_summary(session, ctx)
+                            );
                             downstream_state.maybe_finished(request_done);
                         },
                         Err(e) => {
                             // mark request done, attempt to drain receive
-                            warn!("Upstream h2 body send error: {e}");
+                            // warn!("Upstream h2 body send error: {e}");
                             // upstream is what actually errored but we don't want to continue
                             // polling the downstream body
                             downstream_state.to_errored();
@@ -737,16 +760,31 @@ where
         }
 
         if let Some(data) = data {
-            debug!("Write {} bytes body to h2 upstream", data.len());
+            warn!(
+                "repro: send_body_to2 about to await upstream write bytes={} end_of_body={end_of_body}, {}",
+                data.len(),
+                self.inner.request_summary(session, ctx)
+            );
             write_body(client_body, data, end_of_body, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
+            warn!(
+                "repro: send_body_to2 upstream write returned bytes_written end_of_body={end_of_body}, {}",
+                self.inner.request_summary(session, ctx)
+            );
         } else {
-            debug!("Read downstream body done");
+            warn!(
+                "repro: send_body_to2 about to await upstream empty END_STREAM, {}",
+                self.inner.request_summary(session, ctx)
+            );
             /* send a standalone END_STREAM flag */
             write_body(client_body, Bytes::new(), true, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
+            warn!(
+                "repro: send_body_to2 upstream empty END_STREAM returned, {}",
+                self.inner.request_summary(session, ctx)
+            );
         }
 
         Ok(end_of_body)

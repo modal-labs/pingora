@@ -21,6 +21,7 @@ use pingora_timeout::timeout;
 
 use bytes::Bytes;
 use h2::SendStream;
+use log::warn;
 
 pub mod client;
 pub mod server;
@@ -31,8 +32,15 @@ async fn reserve_and_send(
     end: bool,
 ) -> Result<()> {
     // reserve remaining bytes then wait
+    let stream_id = writer.stream_id();
+    let requested = remaining.len();
+    warn!(
+        "repro: h2 write_body reserve_capacity stream_id={stream_id:?} requested={requested} end={end}"
+    );
     writer.reserve_capacity(remaining.len());
+    warn!("repro: h2 write_body poll_capacity pending stream_id={stream_id:?} requested={requested}");
     let res = std::future::poll_fn(|cx| writer.poll_capacity(cx)).await;
+    warn!("repro: h2 write_body poll_capacity returned stream_id={stream_id:?} requested={requested}");
 
     match res {
         None => Error::e_explain(H2Error, "cannot reserve capacity"),
@@ -40,6 +48,12 @@ async fn reserve_and_send(
             let n = ready.or_err(H2Error, "while waiting for capacity")?;
             let remaining_size = remaining.len();
             let data_to_send = remaining.split_to(std::cmp::min(remaining_size, n));
+            warn!(
+                "repro: h2 write_body send_data stream_id={stream_id:?} capacity={n} chunk={} remaining_after={} end={}",
+                data_to_send.len(),
+                remaining.len(),
+                remaining.is_empty() && end,
+            );
             writer
                 .send_data(data_to_send, remaining.is_empty() && end)
                 .or_err(WriteError, "while writing h2 request body")?;

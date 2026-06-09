@@ -85,6 +85,11 @@ impl SocketDigest {
         }
     }
 
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.raw_fd
+    }
+
     #[cfg(windows)]
     pub fn from_raw_socket(raw_sock: std::os::windows::io::RawSocket) -> SocketDigest {
         SocketDigest {
@@ -93,6 +98,11 @@ impl SocketDigest {
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
         }
+    }
+
+    #[cfg(windows)]
+    pub fn raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.raw_sock
     }
 
     #[cfg(unix)]
