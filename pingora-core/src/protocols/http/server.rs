@@ -601,6 +601,22 @@ impl Session {
         }
     }
 
+    /// Attach a bounded lossy fork with an owned-chunk mapper (HTTP/1 and HTTP/2 only).
+    pub fn attach_request_body_fork_with<F>(
+        &mut self,
+        max_chunks: usize,
+        mapper: F,
+    ) -> Option<BodyForkReceiver>
+    where
+        F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    {
+        match self {
+            Self::H1(s) => s.attach_request_body_fork_with(max_chunks, mapper),
+            Self::H2(s) => s.attach_request_body_fork_with(max_chunks, mapper),
+            Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),

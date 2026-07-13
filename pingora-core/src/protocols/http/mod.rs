@@ -29,7 +29,8 @@ pub mod v1;
 pub mod v2;
 
 pub use body_fork::{
-    body_fork_pair, BodyForkPushError, BodyForkReceiver, BodyForkSender,
+    body_fork_pair, body_fork_pair_with, BodyForkEvent, BodyForkPushError, BodyForkReceiver,
+    BodyForkSender,
 };
 pub use server::Session as ServerSession;
 

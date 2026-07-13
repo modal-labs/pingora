@@ -30,7 +30,9 @@ use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
-use crate::protocols::http::body_fork::{body_fork_pair, BodyForkReceiver, BodyForkSender};
+use crate::protocols::http::body_fork::{
+    body_fork_pair, body_fork_pair_with, BodyForkReceiver, BodyForkSender,
+};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
@@ -177,15 +179,10 @@ impl HttpSession {
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         // TODO: timeout
-        match self
-            .request_body_reader
-            .data()
-            .await
-            .transpose()
-            .or_err(
-                ErrorType::ReadError,
-                "while reading downstream request body",
-            ) {
+        match self.request_body_reader.data().await.transpose().or_err(
+            ErrorType::ReadError,
+            "while reading downstream request body",
+        ) {
             Ok(Some(ref data)) => {
                 self.body_read += data.len();
                 if let Some(buffer) = self.retry_buffer.as_mut() {
@@ -258,6 +255,25 @@ impl HttpSession {
         Some(rx)
     }
 
+    /// Attach a bounded lossy fork with an owned-chunk mapper.
+    ///
+    /// The mapper runs for every forked chunk before queue admission. Returning [`None`] aborts
+    /// only the fork; the primary request continues with its original chunk.
+    pub fn attach_request_body_fork_with<F>(
+        &mut self,
+        max_chunks: usize,
+        mapper: F,
+    ) -> Option<BodyForkReceiver>
+    where
+        F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    {
+        if self.body_fork.is_some() {
+            return None;
+        }
+        let (tx, rx) = body_fork_pair_with(max_chunks, mapper);
+        self.body_fork = Some(tx);
+        Some(rx)
+    }
 
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     // NOTE for h2 it may be worth allowing cancellation of the stream via reset.

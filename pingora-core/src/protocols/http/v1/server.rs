@@ -34,7 +34,7 @@ use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use crate::protocols::http::{
     body_buffer::FixedBuffer,
-    body_fork::{body_fork_pair, BodyForkReceiver, BodyForkSender},
+    body_fork::{body_fork_pair, body_fork_pair_with, BodyForkReceiver, BodyForkSender},
     date, HttpTask,
 };
 use crate::protocols::{Digest, SocketAddr, Stream};
@@ -461,8 +461,8 @@ impl HttpSession {
 
     /// Attach a bounded lossy fork of the request body. Returns [`None`] if a fork is already
     /// attached. Call before the first [`Self::read_body_bytes`]. Up to `max_chunks` chunks
-    /// are queued; if [`BodyForkSender::try_push`] would exceed that, the fork sender is dropped
-    /// and the receiver stops after draining queued data.
+    /// are queued; if [`BodyForkSender::try_push`] fails, the fork sender is dropped and queued
+    /// data is discarded.
     pub fn attach_request_body_fork(&mut self, max_chunks: usize) -> Option<BodyForkReceiver> {
         if self.body_fork.is_some() {
             return None;
@@ -472,6 +472,25 @@ impl HttpSession {
         Some(rx)
     }
 
+    /// Attach a bounded lossy fork with an owned-chunk mapper.
+    ///
+    /// The mapper runs for every forked chunk before queue admission. Returning [`None`] aborts
+    /// only the fork; the primary request continues with its original chunk.
+    pub fn attach_request_body_fork_with<F>(
+        &mut self,
+        max_chunks: usize,
+        mapper: F,
+    ) -> Option<BodyForkReceiver>
+    where
+        F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    {
+        if self.body_fork.is_some() {
+            return None;
+        }
+        let (tx, rx) = body_fork_pair_with(max_chunks, mapper);
+        self.body_fork = Some(tx);
+        Some(rx)
+    }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
         self.init_body_reader();
