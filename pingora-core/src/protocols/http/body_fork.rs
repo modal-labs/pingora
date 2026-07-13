@@ -23,7 +23,7 @@
 //! - **Clean EOF** — call [`BodyForkSender::finish`] (consumes self).
 //!   Pending chunks are preserved for the receiver to drain.
 //! - **Abort** — drop the sender without calling `finish`.
-//!   Pending chunks are cleared immediately; [`BodyForkReceiver::recv_event`] reports the abort.
+//!   Pending chunks are cleared immediately; [`BodyForkReceiver::recv`] reports the abort.
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -40,27 +40,14 @@ pub enum BodyForkPushError {
     Rejected,
 }
 
+/// Error from [`BodyForkReceiver::recv`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyForkPhase {
-    Open,
-    Finished,
-    Aborted,
-}
+pub struct BodyForkAborted;
 
-/// Data or completion returned by [`BodyForkReceiver::recv_event`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum BodyForkEvent {
-    /// All chunks that were queued when the receiver was polled.
-    Chunks(VecDeque<Bytes>),
-    /// The sender reached clean end-of-body and no queued chunks remain.
-    Finished,
-    /// The sender was dropped before clean end-of-body.
+enum BodyForkState {
+    Open(VecDeque<Bytes>),
+    Finished(VecDeque<Bytes>),
     Aborted,
-}
-
-struct BodyForkState {
-    pending: VecDeque<Bytes>,
-    phase: BodyForkPhase,
 }
 
 struct BodyForkShared {
@@ -108,10 +95,7 @@ fn body_fork_pair_inner(
 ) -> (BodyForkSender, BodyForkReceiver) {
     let inner = Arc::new(BodyForkShared {
         max_chunks,
-        state: Mutex::new(BodyForkState {
-            pending: VecDeque::new(),
-            phase: BodyForkPhase::Open,
-        }),
+        state: Mutex::new(BodyForkState::Open(VecDeque::new())),
         notify: Notify::new(),
     });
     (
@@ -135,10 +119,14 @@ impl BodyForkSender {
         }
 
         let mut g = self.inner.state.lock();
-        if g.pending.len() >= self.inner.max_chunks {
+        let pending = match &mut *g {
+            BodyForkState::Open(pending) => pending,
+            _ => unreachable!("sender cannot be used after finish or abort"),
+        };
+        if pending.len() >= self.inner.max_chunks {
             return Err(BodyForkPushError::Full);
         }
-        g.pending.push_back(chunk);
+        pending.push_back(chunk);
         drop(g);
         self.inner.notify.notify_waiters();
         Ok(())
@@ -148,7 +136,12 @@ impl BodyForkSender {
     /// Consumes the sender so no further pushes are possible.
     pub fn finish(self) {
         let mut g = self.inner.state.lock();
-        g.phase = BodyForkPhase::Finished;
+        let pending = match &mut *g {
+            BodyForkState::Open(pending) => pending,
+            _ => unreachable!("sender cannot be finished after finish or abort"),
+        };
+        let pending = std::mem::take(pending);
+        *g = BodyForkState::Finished(pending);
         drop(g);
         self.inner.notify.notify_waiters();
     }
@@ -157,10 +150,9 @@ impl BodyForkSender {
 impl Drop for BodyForkSender {
     fn drop(&mut self) {
         let mut g = self.inner.state.lock();
-        if g.phase == BodyForkPhase::Open {
+        if matches!(*g, BodyForkState::Open(_)) {
             // Abort: the stream is incomplete, discard partial data.
-            g.pending.clear();
-            g.phase = BodyForkPhase::Aborted;
+            *g = BodyForkState::Aborted;
         }
         drop(g);
         self.inner.notify.notify_waiters();
@@ -168,45 +160,43 @@ impl Drop for BodyForkSender {
 }
 
 enum RecvPoll {
-    Ready(BodyForkEvent),
+    Ready(Result<Option<VecDeque<Bytes>>, BodyForkAborted>),
     Wait,
 }
 
 fn poll_recv_available(shared: &BodyForkShared) -> RecvPoll {
     let mut g = shared.state.lock();
 
-    if !g.pending.is_empty() {
-        let chunks = std::mem::take(&mut g.pending);
-        return RecvPoll::Ready(BodyForkEvent::Chunks(chunks));
-    }
-
-    match g.phase {
-        BodyForkPhase::Open => RecvPoll::Wait,
-        BodyForkPhase::Finished => RecvPoll::Ready(BodyForkEvent::Finished),
-        BodyForkPhase::Aborted => RecvPoll::Ready(BodyForkEvent::Aborted),
+    match &mut *g {
+        BodyForkState::Open(pending) => {
+            if pending.is_empty() {
+                RecvPoll::Wait
+            } else {
+                RecvPoll::Ready(Ok(Some(std::mem::take(pending))))
+            }
+        }
+        BodyForkState::Finished(pending) => {
+            if pending.is_empty() {
+                RecvPoll::Ready(Ok(None))
+            } else {
+                RecvPoll::Ready(Ok(Some(std::mem::take(pending))))
+            }
+        }
+        BodyForkState::Aborted => RecvPoll::Ready(Err(BodyForkAborted)),
     }
 }
 
 impl BodyForkReceiver {
-    /// Receive queued body chunks or the explicit sender completion state.
-    pub async fn recv_event(&mut self) -> BodyForkEvent {
+    /// Receive all queued body chunks.
+    ///
+    /// Returns [`Ok(None)`] after clean end-of-body and [`Err`] if the sender aborts.
+    pub async fn recv(&mut self) -> Result<Option<VecDeque<Bytes>>, BodyForkAborted> {
         loop {
             let notified = self.inner.notify.notified();
             match poll_recv_available(&self.inner) {
-                RecvPoll::Ready(event) => return event,
+                RecvPoll::Ready(result) => return result,
                 RecvPoll::Wait => notified.await,
             }
-        }
-    }
-
-    /// Receive all queued body chunks.
-    ///
-    /// Returns [`None`] for both clean finish and abort for backward compatibility. Call
-    /// [`Self::recv_event`] when the distinction matters.
-    pub async fn recv(&mut self) -> Option<VecDeque<Bytes>> {
-        match self.recv_event().await {
-            BodyForkEvent::Chunks(chunks) => Some(chunks),
-            BodyForkEvent::Finished | BodyForkEvent::Aborted => None,
         }
     }
 
@@ -217,7 +207,7 @@ impl BodyForkReceiver {
     pub async fn wait_for_abort(&self) {
         loop {
             let notified = self.inner.notify.notified();
-            if self.inner.state.lock().phase == BodyForkPhase::Aborted {
+            if matches!(*self.inner.state.lock(), BodyForkState::Aborted) {
                 return;
             }
             notified.await;
@@ -242,8 +232,8 @@ mod tests {
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"bc")).unwrap();
         tx.finish();
-        assert_eq!(flatten(rx.recv().await.unwrap()), b"abc");
-        assert!(rx.recv().await.is_none());
+        assert_eq!(flatten(rx.recv().await.unwrap().unwrap()), b"abc");
+        assert!(rx.recv().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -256,8 +246,8 @@ mod tests {
             Err(BodyForkPushError::Full)
         );
         tx.finish();
-        assert_eq!(flatten(rx.recv().await.unwrap()), b"abcd");
-        assert!(rx.recv().await.is_none());
+        assert_eq!(flatten(rx.recv().await.unwrap().unwrap()), b"abcd");
+        assert!(rx.recv().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -270,13 +260,13 @@ mod tests {
             Err(BodyForkPushError::Full)
         );
         // Drain — frees both slots.
-        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap().unwrap();
         // Now we can push again.
         tx.try_push(Bytes::from_static(b"c")).unwrap();
         tx.try_push(Bytes::from_static(b"d")).unwrap();
         tx.finish();
-        assert_eq!(flatten(rx.recv().await.unwrap()), b"cd");
-        assert!(rx.recv().await.is_none());
+        assert_eq!(flatten(rx.recv().await.unwrap().unwrap()), b"cd");
+        assert!(rx.recv().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -284,14 +274,14 @@ mod tests {
         let (tx, mut rx) = body_fork_pair(32);
         tx.try_push(Bytes::from_static(b"x")).unwrap();
         drop(tx);
-        assert_eq!(rx.recv_event().await, BodyForkEvent::Aborted);
+        assert_eq!(rx.recv().await, Err(BodyForkAborted));
     }
 
     #[tokio::test]
     async fn finish_empty_body() {
         let (tx, mut rx) = body_fork_pair(32);
         tx.finish();
-        assert_eq!(rx.recv_event().await, BodyForkEvent::Finished);
+        assert_eq!(rx.recv().await, Ok(None));
     }
 
     #[tokio::test]
@@ -299,13 +289,13 @@ mod tests {
         let (tx, mut rx) = body_fork_pair(32);
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"b")).unwrap();
-        let chunks = rx.recv().await.unwrap();
+        let chunks = rx.recv().await.unwrap().unwrap();
         assert_eq!(chunks.len(), 2);
         assert_eq!(flatten(chunks), b"ab");
         tx.try_push(Bytes::from_static(b"z")).unwrap();
         tx.finish();
-        assert_eq!(flatten(rx.recv().await.unwrap()), b"z");
-        assert!(rx.recv().await.is_none());
+        assert_eq!(flatten(rx.recv().await.unwrap().unwrap()), b"z");
+        assert!(rx.recv().await.unwrap().is_none());
     }
 
     struct TrackedBytes {
@@ -346,7 +336,7 @@ mod tests {
             Err(BodyForkPushError::Rejected)
         );
         drop(tx);
-        assert_eq!(rx.recv_event().await, BodyForkEvent::Aborted);
+        assert_eq!(rx.recv().await, Err(BodyForkAborted));
     }
 
     #[tokio::test]
@@ -367,12 +357,12 @@ mod tests {
         );
 
         tx.finish();
-        let BodyForkEvent::Chunks(chunks) = rx.recv_event().await else {
+        let Some(chunks) = rx.recv().await.unwrap() else {
             panic!("expected queued chunk");
         };
         drop(chunks);
         assert_eq!(live_bytes.load(Ordering::SeqCst), 0);
-        assert_eq!(rx.recv_event().await, BodyForkEvent::Finished);
+        assert_eq!(rx.recv().await, Ok(None));
     }
 
     #[tokio::test]
@@ -386,7 +376,7 @@ mod tests {
         for _ in 0..CHUNKS_PER_BATCH {
             tx.try_push(Bytes::from_static(b"x")).unwrap();
         }
-        let BodyForkEvent::Chunks(first_batch) = rx.recv_event().await else {
+        let Some(first_batch) = rx.recv().await.unwrap() else {
             panic!("expected first batch");
         };
         for _ in 0..CHUNKS_PER_BATCH {
@@ -406,14 +396,14 @@ mod tests {
             0,
             "aborting clears the refilled queue"
         );
-        assert_eq!(rx.recv_event().await, BodyForkEvent::Aborted);
+        assert_eq!(rx.recv().await, Err(BodyForkAborted));
     }
 
     #[tokio::test]
     async fn abort_wait_is_persistent() {
         let (tx, mut rx) = body_fork_pair(1);
         tx.try_push(Bytes::from_static(b"x")).unwrap();
-        let BodyForkEvent::Chunks(batch) = rx.recv_event().await else {
+        let Some(batch) = rx.recv().await.unwrap() else {
             panic!("expected queued chunk");
         };
 
@@ -422,6 +412,6 @@ mod tests {
             .await
             .expect("abort recorded before waiter registration must still be observed");
         drop(batch);
-        assert_eq!(rx.recv_event().await, BodyForkEvent::Aborted);
+        assert_eq!(rx.recv().await, Err(BodyForkAborted));
     }
 }

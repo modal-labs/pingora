@@ -61,7 +61,7 @@ use pingora_core::connectors::http::custom;
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
-use pingora_core::protocols::http::body_fork::{BodyForkEvent, BodyForkReceiver};
+use pingora_core::protocols::http::body_fork::{BodyForkAborted, BodyForkReceiver};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
@@ -1074,8 +1074,8 @@ async fn feed_mirror_body(
     subrequest: tokio::task::JoinHandle<()>,
 ) {
     loop {
-        match body_rx.recv_event().await {
-            BodyForkEvent::Chunks(chunks) => {
+        match body_rx.recv().await {
+            Ok(Some(chunks)) => {
                 for chunk in chunks {
                     tokio::select! {
                         biased;
@@ -1093,7 +1093,7 @@ async fn feed_mirror_body(
                     }
                 }
             }
-            BodyForkEvent::Finished => {
+            Ok(None) => {
                 let _ = tx.send(HttpTask::Body(None, true)).await;
 
                 // Keep tx alive until the subrequest pipeline finishes (signaled
@@ -1101,7 +1101,7 @@ async fn feed_mirror_body(
                 let _ = drain.await;
                 return;
             }
-            BodyForkEvent::Aborted => {
+            Err(BodyForkAborted) => {
                 subrequest.abort();
                 let _ = subrequest.await;
                 let _ = drain.await;
