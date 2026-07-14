@@ -14,8 +14,8 @@
 
 //! Bounded in-memory tee of request body bytes.
 //!
-//! Pending data is stored as a `VecDeque<Bytes>`. [`BodyForkSender::try_push`] optionally maps
-//! and enqueues an owned `Bytes` handle; [`BodyForkReceiver::recv`] drains everything currently
+//! Pending data is stored as a `VecDeque<Bytes>`. [`BodyForkSender::try_push`] maps and enqueues
+//! an owned `Bytes` handle; [`BodyForkReceiver::recv`] drains everything currently
 //! queued.
 //!
 //! Two ways to close the sender:
@@ -61,20 +61,12 @@ struct BodyForkShared {
 /// Dropping without calling `finish` aborts the fork (clears buffered data).
 pub struct BodyForkSender {
     inner: Arc<BodyForkShared>,
-    mapper: Option<Box<dyn Fn(Bytes) -> Option<Bytes> + Send + Sync>>,
+    mapper: Box<dyn Fn(Bytes) -> Option<Bytes> + Send + Sync>,
 }
 
 /// Receive side: [`recv`](BodyForkReceiver::recv) drains all queued chunks.
 pub struct BodyForkReceiver {
     inner: Arc<BodyForkShared>,
-}
-
-/// Create a bounded body fork pair.
-///
-/// `max_chunks` limits the number of `Bytes` chunks that can be queued at once.
-/// When the receiver drains chunks, capacity is freed for more pushes.
-pub fn body_fork_pair(max_chunks: usize) -> (BodyForkSender, BodyForkReceiver) {
-    body_fork_pair_inner(max_chunks, None)
 }
 
 /// Create a bounded body fork pair with an owned-chunk mapper.
@@ -86,13 +78,6 @@ pub fn body_fork_pair_with<F>(max_chunks: usize, mapper: F) -> (BodyForkSender, 
 where
     F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
 {
-    body_fork_pair_inner(max_chunks, Some(Box::new(mapper)))
-}
-
-fn body_fork_pair_inner(
-    max_chunks: usize,
-    mapper: Option<Box<dyn Fn(Bytes) -> Option<Bytes> + Send + Sync>>,
-) -> (BodyForkSender, BodyForkReceiver) {
     let inner = Arc::new(BodyForkShared {
         max_chunks,
         state: Mutex::new(BodyForkState::Open(VecDeque::new())),
@@ -101,7 +86,7 @@ fn body_fork_pair_inner(
     (
         BodyForkSender {
             inner: inner.clone(),
-            mapper,
+            mapper: Box::new(mapper),
         },
         BodyForkReceiver { inner },
     )
@@ -110,10 +95,7 @@ fn body_fork_pair_inner(
 impl BodyForkSender {
     /// Try to map and queue a body chunk.
     pub fn try_push(&self, chunk: Bytes) -> Result<(), BodyForkPushError> {
-        let chunk = match self.mapper.as_ref() {
-            Some(mapper) => mapper(chunk).ok_or(BodyForkPushError::Rejected)?,
-            None => chunk,
-        };
+        let chunk = (self.mapper)(chunk).ok_or(BodyForkPushError::Rejected)?;
         if chunk.is_empty() {
             return Ok(());
         }
@@ -228,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_finish_recv() {
-        let (tx, mut rx) = body_fork_pair(32);
+        let (tx, mut rx) = body_fork_pair_with(32, Some);
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"bc")).unwrap();
         tx.finish();
@@ -238,7 +220,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_chunks_rejects_push() {
-        let (tx, mut rx) = body_fork_pair(2);
+        let (tx, mut rx) = body_fork_pair_with(2, Some);
         tx.try_push(Bytes::from_static(b"ab")).unwrap();
         tx.try_push(Bytes::from_static(b"cd")).unwrap();
         assert_eq!(
@@ -252,7 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_frees_capacity() {
-        let (tx, mut rx) = body_fork_pair(2);
+        let (tx, mut rx) = body_fork_pair_with(2, Some);
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"b")).unwrap();
         assert_eq!(
@@ -271,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_without_finish_clears_bytes() {
-        let (tx, mut rx) = body_fork_pair(32);
+        let (tx, mut rx) = body_fork_pair_with(32, Some);
         tx.try_push(Bytes::from_static(b"x")).unwrap();
         drop(tx);
         assert_eq!(rx.recv().await, Err(BodyForkAborted));
@@ -279,14 +261,14 @@ mod tests {
 
     #[tokio::test]
     async fn finish_empty_body() {
-        let (tx, mut rx) = body_fork_pair(32);
+        let (tx, mut rx) = body_fork_pair_with(32, Some);
         tx.finish();
         assert_eq!(rx.recv().await, Ok(None));
     }
 
     #[tokio::test]
     async fn recv_returns_available_without_waiting_for_end() {
-        let (tx, mut rx) = body_fork_pair(32);
+        let (tx, mut rx) = body_fork_pair_with(32, Some);
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"b")).unwrap();
         let chunks = rx.recv().await.unwrap().unwrap();
@@ -401,7 +383,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_wait_is_persistent() {
-        let (tx, mut rx) = body_fork_pair(1);
+        let (tx, mut rx) = body_fork_pair_with(1, Some);
         tx.try_push(Bytes::from_static(b"x")).unwrap();
         let Some(batch) = rx.recv().await.unwrap() else {
             panic!("expected queued chunk");
