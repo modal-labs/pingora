@@ -589,14 +589,21 @@ impl Session {
         }
     }
 
-    /// Attach a bounded lossy fork of the downstream request body (HTTP/1 and HTTP/2 only).
+    /// Attach a bounded lossy fork with an owned-chunk mapper (HTTP/1 and HTTP/2 only).
     ///
     /// Returns [`None`] for subrequest/custom sessions or if a fork is already attached on the
-    /// underlying session. See [`SessionV1::attach_request_body_fork`].
-    pub fn attach_request_body_fork(&mut self, max_chunks: usize) -> Option<BodyForkReceiver> {
+    /// underlying session. See [`SessionV1::attach_request_body_fork_with`].
+    pub fn attach_request_body_fork_with<F>(
+        &mut self,
+        max_chunks: usize,
+        mapper: F,
+    ) -> Option<BodyForkReceiver>
+    where
+        F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    {
         match self {
-            Self::H1(s) => s.attach_request_body_fork(max_chunks),
-            Self::H2(s) => s.attach_request_body_fork(max_chunks),
+            Self::H1(s) => s.attach_request_body_fork_with(max_chunks, mapper),
+            Self::H2(s) => s.attach_request_body_fork_with(max_chunks, mapper),
             Self::Subrequest(_) | Self::Custom(_) => None,
         }
     }

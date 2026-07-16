@@ -61,7 +61,7 @@ use pingora_core::connectors::http::custom;
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
-use pingora_core::protocols::http::body_fork::BodyForkReceiver;
+use pingora_core::protocols::http::body_fork::{BodyForkAborted, BodyForkReceiver};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
 use pingora_core::protocols::http::custom::CustomMessageWrite;
 use pingora_core::protocols::http::subrequest::server::SubrequestHandle;
@@ -1067,6 +1067,50 @@ impl PreparedSubrequest {
     }
 }
 
+async fn feed_mirror_body(
+    mut body_rx: BodyForkReceiver,
+    tx: mpsc::Sender<HttpTask>,
+    drain: tokio::task::JoinHandle<()>,
+    subrequest: tokio::task::JoinHandle<()>,
+) {
+    loop {
+        match body_rx.recv().await {
+            Ok(Some(chunks)) => {
+                for chunk in chunks {
+                    tokio::select! {
+                        biased;
+                        _ = body_rx.wait_for_abort() => {
+                            subrequest.abort();
+                            let _ = subrequest.await;
+                            let _ = drain.await;
+                            return;
+                        }
+                        sent = tx.send(HttpTask::Body(Some(chunk), false)) => {
+                            if sent.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                let _ = tx.send(HttpTask::Body(None, true)).await;
+
+                // Keep tx alive until the subrequest pipeline finishes (signaled
+                // by the drain task completing when the pipeline drops its sender).
+                let _ = drain.await;
+                return;
+            }
+            Err(BodyForkAborted) => {
+                subrequest.abort();
+                let _ = subrequest.await;
+                let _ = drain.await;
+                return;
+            }
+        }
+    }
+}
+
 impl SubrequestSpawner {
     /// Create a new [`SubrequestSpawner`].
     pub fn new(app: Arc<dyn Subrequest + Send + Sync>) -> SubrequestSpawner {
@@ -1108,7 +1152,7 @@ impl SubrequestSpawner {
     pub fn spawn_mirror_subrequest(
         &self,
         session: &HttpSession,
-        mut body_rx: BodyForkReceiver,
+        body_rx: BodyForkReceiver,
         user_ctx: Option<subrequest::UserCtx>,
     ) {
         let mut ctx_builder = SubrequestCtx::builder().body_mode(BodyMode::ExpectBody);
@@ -1122,24 +1166,9 @@ impl SubrequestSpawner {
         // Drain mirror responses — we don't need them.
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
-        tokio::spawn(async move {
-            // Feed forked body bytes into the subrequest.
-            while let Some(chunks) = body_rx.recv().await {
-                for chunk in chunks {
-                    if tx.send(HttpTask::Body(Some(chunk), false)).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            let _ = tx.send(HttpTask::Body(None, true)).await;
-
-            // Keep tx alive until the subrequest pipeline finishes (signaled
-            // by the drain task completing when the pipeline drops its sender).
-            let _ = drain.await;
-        });
-
         // Run the subrequest through the proxy pipeline.
-        tokio::spawn(async move { prepared.run().await });
+        let subrequest = tokio::spawn(async move { prepared.run().await });
+        tokio::spawn(feed_mirror_body(body_rx, tx, drain, subrequest));
     }
 
     /// Create a subrequest that listens to `HttpTask`s sent from the returned `Sender`
@@ -1439,5 +1468,133 @@ where
 
         proxy.handle_init_modules();
         Service::new(name, proxy)
+    }
+}
+
+#[cfg(test)]
+mod body_fork_tests {
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use pingora_core::protocols::http::body_fork::body_fork_pair_with;
+    use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration};
+
+    use super::*;
+
+    struct TrackedChunk {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for TrackedChunk {
+        fn as_ref(&self) -> &[u8] {
+            b"x"
+        }
+    }
+
+    impl Drop for TrackedChunk {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn pending_task_with_drop_signal() -> (tokio::task::JoinHandle<()>, oneshot::Receiver<()>)
+    {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            struct NotifyOnDrop(Option<oneshot::Sender<()>>);
+
+            impl Drop for NotifyOnDrop {
+                fn drop(&mut self) {
+                    if let Some(tx) = self.0.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+
+            let _guard = NotifyOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        (task, dropped_rx)
+    }
+
+    #[tokio::test]
+    async fn aborted_fork_cancels_subrequest_while_body_send_is_blocked() {
+        let chunk_dropped = Arc::new(AtomicBool::new(false));
+        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
+        body_tx
+            .try_push(Bytes::from_owner(TrackedChunk {
+                dropped: chunk_dropped.clone(),
+            }))
+            .unwrap();
+
+        let (tx, mut input_rx) = mpsc::channel(1);
+        tx.send(HttpTask::Body(
+            Some(Bytes::from_static(b"channel-full")),
+            false,
+        ))
+        .await
+        .unwrap();
+        let drain = tokio::spawn(async {});
+        let (subrequest, mut subrequest_dropped) = pending_task_with_drop_signal().await;
+        let feeder = tokio::spawn(feed_mirror_body(body_rx, tx, drain, subrequest));
+        tokio::task::yield_now().await;
+
+        drop(body_tx);
+
+        timeout(Duration::from_secs(1), feeder)
+            .await
+            .expect("feeder must observe abort while channel send is blocked")
+            .unwrap();
+        timeout(Duration::from_secs(1), &mut subrequest_dropped)
+            .await
+            .expect("subrequest must be cancelled")
+            .unwrap();
+        assert!(
+            chunk_dropped.load(Ordering::SeqCst),
+            "the blocked fork chunk must be dropped on cancellation"
+        );
+        assert!(matches!(
+            input_rx.try_recv(),
+            Ok(HttpTask::Body(Some(chunk), false)) if chunk == Bytes::from_static(b"channel-full")
+        ));
+    }
+
+    #[tokio::test]
+    async fn finished_fork_sends_clean_eof_without_cancelling_subrequest() {
+        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
+        body_tx.try_push(Bytes::from_static(b"body")).unwrap();
+        body_tx.finish();
+
+        let (tx, mut input_rx) = mpsc::channel(2);
+        let drain = tokio::spawn(async {});
+        let (subrequest, mut subrequest_dropped) = pending_task_with_drop_signal().await;
+        let subrequest_abort = subrequest.abort_handle();
+
+        feed_mirror_body(body_rx, tx, drain, subrequest).await;
+
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HttpTask::Body(Some(chunk), false)) if chunk == Bytes::from_static(b"body")
+        ));
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HttpTask::Body(None, true))
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), &mut subrequest_dropped)
+                .await
+                .is_err(),
+            "clean finish must not cancel the subrequest"
+        );
+
+        subrequest_abort.abort();
+        timeout(Duration::from_secs(1), &mut subrequest_dropped)
+            .await
+            .expect("test cleanup must cancel the detached subrequest")
+            .unwrap();
     }
 }
