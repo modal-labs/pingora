@@ -192,7 +192,7 @@ impl HttpSession {
                     }
                 }
                 if self.request_body_reader.is_end_stream() {
-                    // Finish the fork immediately if finished, 
+                    // Finish the fork immediately if finished,
                     // rather than wait for another poll to return EOF.
                     // This is valuable for smaller requests where the body is read in a single poll.
                     if let Some(tx) = self.body_fork.take() {
@@ -675,6 +675,59 @@ mod test {
     use super::*;
     use http::{HeaderValue, Method, Request};
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn body_fork_finishes_after_final_nonempty_read() {
+        let (client, server) = duplex(65536);
+        let client_task = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let response = {
+                let mut h2 = h2.ready().await.unwrap();
+                let (response, mut body) = h2.send_request(request, false).unwrap();
+                body.send_data(Bytes::from_static(b"abc"), true).unwrap();
+                response
+            };
+            assert_eq!(response.await.unwrap().status(), 200);
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let mut http = HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut fork = http.attach_request_body_fork_with(1, Some).unwrap();
+
+        let body = http.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body, b"abc".as_slice());
+
+        let chunks = fork.recv().await.unwrap().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], b"abc".as_slice());
+        assert!(tokio::time::timeout(Duration::from_secs(1), fork.recv())
+            .await
+            .expect("body fork did not finish after the final nonempty read")
+            .unwrap()
+            .is_none());
+
+        let response = Box::new(ResponseHeader::build(200, None).unwrap());
+        http.write_response_header(response, true).unwrap();
+        drop(http);
+
+        let (_, client_result) = tokio::join!(
+            async { while connection.accept().await.is_some() {} },
+            client_task,
+        );
+        client_result.unwrap();
+    }
 
     #[tokio::test]
     async fn test_server_handshake_accept_request() {
