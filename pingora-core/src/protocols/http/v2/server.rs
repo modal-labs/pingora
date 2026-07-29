@@ -191,6 +191,14 @@ impl HttpSession {
                         self.body_fork = None; // abort: drop sender
                     }
                 }
+                if self.request_body_reader.is_end_stream() {
+                    // Finish the fork immediately if finished, 
+                    // rather than wait for another poll to return EOF.
+                    // This is valuable for smaller requests where the body is read in a single poll.
+                    if let Some(tx) = self.body_fork.take() {
+                        tx.finish();
+                    }
+                }
                 let _ = self
                     .request_body_reader
                     .flow_control()
