@@ -444,6 +444,14 @@ impl HttpSession {
                         self.body_fork = None; // abort: drop sender
                     }
                 }
+                if self.body_reader.body_done() {
+                    // Finish the fork immediately if finished,
+                    // rather than wait for another poll to return EOF.
+                    // This is valuable for smaller requests where the body is read in a single poll.
+                    if let Some(tx) = self.body_fork.take() {
+                        tx.finish();
+                    }
+                }
                 Ok(Some(bytes))
             }
             Ok(None) => {
@@ -1472,6 +1480,27 @@ mod tests_stream {
         assert_eq!(res, input3.as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
         assert_eq!(http_stream.body_bytes_read(), 3);
+    }
+
+    #[tokio::test]
+    async fn body_fork_finishes_after_final_nonempty_read() {
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let mut fork = http_stream.attach_request_body_fork_with(1, Some).unwrap();
+
+        let body = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body, b"abc".as_slice());
+
+        let chunks = fork.recv().await.unwrap().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], b"abc".as_slice());
+        assert!(tokio::time::timeout(Duration::from_secs(1), fork.recv())
+            .await
+            .expect("body fork did not finish after the final nonempty read")
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
