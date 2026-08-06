@@ -44,18 +44,9 @@ impl Stub {
     }
 }
 
-// How long to wait for h2 to accept a new stream on a connection that passed
-// the admission check. ready() resolves ~immediately below the server's
-// advertised stream limit; a longer wait means the connection is actually at
-// capacity (possible before the server's initial SETTINGS frame is processed,
-// when the advertised limit isn't known yet), and the caller is better served
-// by dialing another connection than by queueing behind long-lived streams.
-const H2_STREAM_READY_TIMEOUT: Duration = Duration::from_millis(500);
-
 // Decrements a stream counter on drop unless disarmed. spawn_stream() can be
-// cancelled while parked in ready() (callers race it against the downstream
-// request lifetime); without this guard the increment would leak and the
-// connection would permanently appear busier than it is.
+// cancelled while creating a stream; without this guard the increment would
+// leak and the connection would permanently appear busier than it is.
 struct StreamCounterGuard<'a>(Option<&'a AtomicUsize>);
 
 impl<'a> StreamCounterGuard<'a> {
@@ -187,23 +178,16 @@ impl ConnectionRef {
             return Ok(None);
         }
 
-        // Undo the increment above if stream creation fails, times out, or
-        // this future is cancelled while waiting.
+        // Undo the increment above if stream creation fails or this future is
+        // cancelled while waiting.
         let guard = StreamCounterGuard::new(&self.0.current_streams);
 
-        match pingora_timeout::timeout(H2_STREAM_READY_TIMEOUT, self.0.connection_stub.new_stream())
-            .await
-        {
-            // Connection is at its real capacity even though the admission
-            // check passed (e.g. the server's initial SETTINGS had not been
-            // processed yet). Report no free stream so the caller dials a
-            // new connection instead of queueing invisibly.
-            Err(_elapsed) => Ok(None),
-            Ok(Ok(send_req)) => {
+        match self.0.connection_stub.new_stream().await {
+            Ok(send_req) => {
                 guard.disarm();
                 Ok(Some(Http2Session::new(send_req, self.clone())))
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
                 // accepts new streams. We can still try to create new connection.
                 if e.root_cause()
@@ -670,8 +654,8 @@ mod tests {
                         .handshake::<_, Bytes>(socket)
                         .await
                         .unwrap();
-                    // Keep the connection alive without answering anything so
-                    // the first stream's slot stays occupied.
+                    // Keep the connection alive while the first Pingora
+                    // session remains active.
                     while (conn.accept().await).is_some() {}
                 });
             }
@@ -687,22 +671,27 @@ mod tests {
             .new_http_session::<HttpPeer, ()>(&peer)
             .await
             .unwrap();
-        let _h2_1 = match h2 {
+        let h2_1 = match h2 {
             HttpSession::H2(h2_stream) => h2_stream,
             _ => panic!("expect h2"),
         };
 
-        // Let the connection task process the server's initial SETTINGS.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait until the connection task has processed the server's initial
+        // SETTINGS rather than relying on scheduler timing.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while h2_1.conn.0.connection_stub.0.current_max_send_streams() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server SETTINGS was not processed");
 
         // 1023 configured slots remain, but the server allows one concurrent
         // stream: the connector must report "no free stream" so the caller
         // dials a new connection, not queue the request inside h2 behind the
         // live stream.
-        let start = std::time::Instant::now();
         let reused = connector.reused_http_session(&peer).await.unwrap();
         assert!(reused.is_none());
-        assert!(start.elapsed() < H2_STREAM_READY_TIMEOUT);
     }
 
     #[tokio::test]
