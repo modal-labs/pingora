@@ -1524,7 +1524,7 @@ mod body_fork_tests {
     #[tokio::test]
     async fn aborted_fork_cancels_subrequest_while_body_send_is_blocked() {
         let chunk_dropped = Arc::new(AtomicBool::new(false));
-        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
+        let (body_tx, body_rx) = body_fork_pair_with(1);
         body_tx
             .try_push(Bytes::from_owner(TrackedChunk {
                 dropped: chunk_dropped.clone(),
@@ -1565,7 +1565,7 @@ mod body_fork_tests {
 
     #[tokio::test]
     async fn finished_fork_sends_clean_eof_without_cancelling_subrequest() {
-        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
+        let (body_tx, body_rx) = body_fork_pair_with(1);
         body_tx.try_push(Bytes::from_static(b"body")).unwrap();
         body_tx.finish();
 
