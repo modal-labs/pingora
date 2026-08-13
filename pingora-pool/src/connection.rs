@@ -259,9 +259,11 @@ impl<S> ConnectionPool<S> {
             match pool.get(&meta.key) {
                 Some(v) => (*v).clone(),
                 None => {
-                    warn!("Fail to get pool node for {:?}", meta);
+                    // Empty-node cleanup can remove the node before LRU eviction
+                    // processes the connection metadata.
+                    debug!("pool node already removed for {:?}", meta);
                     return;
-                } // nothing to pop, should return error?
+                }
             }
         }; // read lock released here
 
