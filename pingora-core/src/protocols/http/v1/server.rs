@@ -959,8 +959,16 @@ impl HttpSession {
     }
 
     pub fn enable_retry_buffering(&mut self) {
+        self.enable_retry_buffering_with_limit(BODY_BUF_LIMIT)
+    }
+
+    /// Enable retry buffering with a custom byte limit. If the downstream
+    /// body grows beyond `limit`, the buffer is marked truncated and
+    /// [`Self::get_retry_buffer`] returns `None`. No-op if retry buffering
+    /// is already enabled.
+    pub fn enable_retry_buffering_with_limit(&mut self, limit: usize) {
         if self.retry_buffer.is_none() {
-            self.retry_buffer = Some(FixedBuffer::new(BODY_BUF_LIMIT))
+            self.retry_buffer = Some(FixedBuffer::new(limit))
         }
     }
 
@@ -1480,6 +1488,51 @@ mod tests_stream {
         assert_eq!(res, input3.as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
         assert_eq!(http_stream.body_bytes_read(), 3);
+    }
+
+    async fn read_full_body(http_stream: &mut HttpSession) -> Vec<u8> {
+        let mut body = Vec::new();
+        while let Some(chunk) = http_stream.read_body_bytes().await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        body
+    }
+
+    fn mock_post_session(body: &[u8]) -> HttpSession {
+        let mut input = format!(
+            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        input.extend_from_slice(body);
+        let mock_io = Builder::new().read(&input[..]).build();
+        HttpSession::new(Box::new(mock_io))
+    }
+
+    #[tokio::test]
+    async fn retry_buffer_honors_custom_limit() {
+        init_log();
+        let body = vec![b'a'; 128 * 1024];
+        let mut http_stream = mock_post_session(&body);
+        http_stream.read_request().await.unwrap();
+
+        http_stream.enable_retry_buffering_with_limit(256 * 1024);
+        assert_eq!(read_full_body(&mut http_stream).await, body);
+        assert!(!http_stream.retry_buffer_truncated());
+        assert_eq!(http_stream.get_retry_buffer().unwrap(), body.as_slice());
+    }
+
+    #[tokio::test]
+    async fn retry_buffer_default_limit_truncates_large_body() {
+        init_log();
+        let body = vec![b'a'; 128 * 1024];
+        let mut http_stream = mock_post_session(&body);
+        http_stream.read_request().await.unwrap();
+
+        http_stream.enable_retry_buffering();
+        assert_eq!(read_full_body(&mut http_stream).await, body);
+        assert!(http_stream.retry_buffer_truncated());
+        assert!(http_stream.get_retry_buffer().is_none());
     }
 
     #[tokio::test]

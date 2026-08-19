@@ -589,6 +589,17 @@ impl Session {
         }
     }
 
+    /// Enable retry buffering with a custom byte limit. No-op if retry
+    /// buffering is already enabled.
+    pub fn enable_retry_buffering_with_limit(&mut self, limit: usize) {
+        match self {
+            Self::H1(s) => s.enable_retry_buffering_with_limit(limit),
+            Self::H2(s) => s.enable_retry_buffering_with_limit(limit),
+            Self::Subrequest(s) => s.enable_retry_buffering_with_limit(limit),
+            Self::Custom(s) => s.enable_retry_buffering_with_limit(limit),
+        }
+    }
+
     /// Attach a bounded lossy fork with an owned-chunk mapper (HTTP/1 and HTTP/2 only).
     ///
     /// Returns [`None`] for subrequest/custom sessions or if a fork is already attached on the

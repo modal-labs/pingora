@@ -88,6 +88,12 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn enable_retry_buffering(&mut self);
 
+    /// Enable retry buffering with a custom byte limit. Custom sessions that
+    /// cannot size their buffer fall back to the default limit.
+    fn enable_retry_buffering_with_limit(&mut self, _limit: usize) {
+        self.enable_retry_buffering();
+    }
+
     fn retry_buffer_truncated(&self) -> bool;
 
     fn get_retry_buffer(&self) -> Option<Bytes>;

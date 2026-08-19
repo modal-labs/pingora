@@ -564,8 +564,16 @@ impl HttpSession {
     }
 
     pub fn enable_retry_buffering(&mut self) {
+        self.enable_retry_buffering_with_limit(BODY_BUF_LIMIT)
+    }
+
+    /// Enable retry buffering with a custom byte limit. If the downstream
+    /// body grows beyond `limit`, the buffer is marked truncated and
+    /// [`Self::get_retry_buffer`] returns `None`. No-op if retry buffering
+    /// is already enabled.
+    pub fn enable_retry_buffering_with_limit(&mut self, limit: usize) {
         if self.retry_buffer.is_none() {
-            self.retry_buffer = Some(FixedBuffer::new(BODY_BUF_LIMIT))
+            self.retry_buffer = Some(FixedBuffer::new(limit))
         }
     }
 
