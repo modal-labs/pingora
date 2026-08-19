@@ -1067,12 +1067,33 @@ impl PreparedSubrequest {
     }
 }
 
+// A mirror subrequest is fire-and-forget: nothing consumes its response, so
+// nothing external bounds its lifetime. If its pipeline stalls (e.g. a hung
+// mirror upstream), the subrequest task, the drain task, and the feeder task
+// would be pinned forever along with the session and its buffered request
+// body. Every wait on subrequest progress is therefore bounded by this
+// timeout; on expiry the subrequest is aborted. A healthy pipeline consumes
+// each body chunk and finishes its upstream exchange well within it, so it
+// only fires when mirror data would be lost anyway.
+const MIRROR_SUBREQUEST_STALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 async fn feed_mirror_body(
     mut body_rx: BodyForkReceiver,
     tx: mpsc::Sender<HttpTask>,
-    drain: tokio::task::JoinHandle<()>,
+    mut drain: tokio::task::JoinHandle<()>,
     subrequest: tokio::task::JoinHandle<()>,
 ) {
+    // Aborting the subrequest drops its session, which drops the pipeline's
+    // task sender and lets the drain task exit, so awaiting drain afterwards
+    // cannot hang.
+    macro_rules! abort_subrequest {
+        () => {{
+            subrequest.abort();
+            let _ = subrequest.await;
+            let _ = drain.await;
+            return;
+        }};
+    }
     loop {
         match body_rx.recv().await {
             Ok(Some(chunks)) => {
@@ -1080,32 +1101,48 @@ async fn feed_mirror_body(
                     tokio::select! {
                         biased;
                         _ = body_rx.wait_for_abort() => {
-                            subrequest.abort();
-                            let _ = subrequest.await;
-                            let _ = drain.await;
-                            return;
+                            abort_subrequest!();
                         }
                         sent = tx.send(HttpTask::Body(Some(chunk), false)) => {
                             if sent.is_err() {
                                 return;
                             }
                         }
+                        _ = time::sleep(MIRROR_SUBREQUEST_STALL_TIMEOUT) => {
+                            // The pipeline stopped consuming body chunks and the
+                            // fork can no longer abort (e.g. already finished).
+                            warn!("mirror subrequest stalled receiving its request body, aborting");
+                            abort_subrequest!();
+                        }
                     }
                 }
             }
             Ok(None) => {
-                let _ = tx.send(HttpTask::Body(None, true)).await;
+                if time::timeout(
+                    MIRROR_SUBREQUEST_STALL_TIMEOUT,
+                    tx.send(HttpTask::Body(None, true)),
+                )
+                .await
+                .is_err()
+                {
+                    warn!("mirror subrequest stalled receiving its body EOF, aborting");
+                    abort_subrequest!();
+                }
 
                 // Keep tx alive until the subrequest pipeline finishes (signaled
-                // by the drain task completing when the pipeline drops its sender).
-                let _ = drain.await;
+                // by the drain task completing when the pipeline drops its
+                // sender), but not indefinitely: a stalled pipeline is aborted.
+                if time::timeout(MIRROR_SUBREQUEST_STALL_TIMEOUT, &mut drain)
+                    .await
+                    .is_err()
+                {
+                    warn!("mirror subrequest stalled after its body completed, aborting");
+                    abort_subrequest!();
+                }
                 return;
             }
             Err(BodyForkAborted) => {
-                subrequest.abort();
-                let _ = subrequest.await;
-                let _ = drain.await;
-                return;
+                abort_subrequest!();
             }
         }
     }
@@ -1596,5 +1633,78 @@ mod body_fork_tests {
             .await
             .expect("test cleanup must cancel the detached subrequest")
             .unwrap();
+    }
+
+    /// A stand-in for a stalled subrequest pipeline: the subrequest task pends
+    /// forever holding `pipeline_tx`, and the drain task only exits once that
+    /// sender is dropped — the same coupling `spawn_mirror_subrequest` sets up.
+    fn stalled_pipeline() -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        let (pipeline_tx, pipeline_rx) = oneshot::channel::<()>();
+        let drain = tokio::spawn(async move {
+            let _ = pipeline_rx.await;
+        });
+        let subrequest = tokio::spawn(async move {
+            let _held = pipeline_tx;
+            pending::<()>().await;
+        });
+        (drain, subrequest)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_wait_on_stalled_pipeline_aborts_subrequest() {
+        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
+        body_tx.try_push(Bytes::from_static(b"body")).unwrap();
+        body_tx.finish();
+
+        let (tx, mut input_rx) = mpsc::channel(2);
+        let (drain, subrequest) = stalled_pipeline();
+
+        // Returns only if the stall timeout fires, aborts the subrequest, and
+        // the drain task observes the dropped pipeline sender. Paused time
+        // auto-advances past MIRROR_SUBREQUEST_STALL_TIMEOUT.
+        feed_mirror_body(body_rx, tx, drain, subrequest).await;
+
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HttpTask::Body(Some(chunk), false)) if chunk == Bytes::from_static(b"body")
+        ));
+        assert!(matches!(
+            input_rx.recv().await,
+            Some(HttpTask::Body(None, true))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_body_send_on_finished_fork_aborts_subrequest() {
+        let chunk_dropped = Arc::new(AtomicBool::new(false));
+        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
+        body_tx
+            .try_push(Bytes::from_owner(TrackedChunk {
+                dropped: chunk_dropped.clone(),
+            }))
+            .unwrap();
+        // A finished fork can no longer signal abort, so only the stall
+        // timeout can unblock the parked send below.
+        body_tx.finish();
+
+        let (tx, mut input_rx) = mpsc::channel(1);
+        tx.send(HttpTask::Body(
+            Some(Bytes::from_static(b"channel-full")),
+            false,
+        ))
+        .await
+        .unwrap();
+        let (drain, subrequest) = stalled_pipeline();
+
+        feed_mirror_body(body_rx, tx, drain, subrequest).await;
+
+        assert!(
+            chunk_dropped.load(Ordering::SeqCst),
+            "the parked fork chunk must be dropped when the stall fires"
+        );
+        assert!(matches!(
+            input_rx.try_recv(),
+            Ok(HttpTask::Body(Some(chunk), false)) if chunk == Bytes::from_static(b"channel-full")
+        ));
     }
 }
