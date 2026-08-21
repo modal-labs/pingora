@@ -474,10 +474,9 @@ impl Session {
 
     /// Serialize the request header into HTTP/1.x wire format.
     ///
-    /// This serializes the parsed request header as the proxy currently
-    /// understands it, including any mutations made by filters, rather than
-    /// the raw bytes as read from the wire. Header name case, ordering and
-    /// duplicates are preserved, but whitespace is normalized.
+    /// This serializes the parsed request header including any mutations 
+    /// made by filters, rather than the raw bytes as read from the wire. 
+    /// Whitespace is normalized.
     pub fn to_h1_raw(&self) -> Bytes {
         match self {
             Self::H1(s) => http_req_header_to_wire(s.req_header())
