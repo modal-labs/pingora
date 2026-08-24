@@ -593,17 +593,18 @@ impl Session {
     ///
     /// Returns [`None`] for subrequest/custom sessions or if a fork is already attached on the
     /// underlying session. See [`SessionV1::attach_request_body_fork_with`].
-    pub fn attach_request_body_fork_with<F>(
+    pub fn attach_request_body_multi_fork_with<F>(
         &mut self,
         max_chunks: usize,
+        forks: usize,
         mapper: F,
-    ) -> Option<BodyForkReceiver>
+    ) -> Option<Vec<BodyForkReceiver>>
     where
         F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
     {
         match self {
-            Self::H1(s) => s.attach_request_body_fork_with(max_chunks, mapper),
-            Self::H2(s) => s.attach_request_body_fork_with(max_chunks, mapper),
+            Self::H1(s) => s.attach_request_body_multi_fork_with(max_chunks, forks, mapper),
+            Self::H2(s) => s.attach_request_body_multi_fork_with(max_chunks, forks, mapper),
             Self::Subrequest(_) | Self::Custom(_) => None,
         }
     }

@@ -40,6 +40,13 @@ pub enum BodyForkPushError {
     Rejected,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyMultiForkPushError {
+    Rejected,
+
+    AllErrored(Vec<BodyForkPushError>),
+}
+
 /// Error from [`BodyForkReceiver::recv`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyForkAborted;
@@ -61,7 +68,6 @@ struct BodyForkShared {
 /// Dropping without calling `finish` aborts the fork (clears buffered data).
 pub struct BodyForkSender {
     inner: Arc<BodyForkShared>,
-    mapper: Box<dyn Fn(Bytes) -> Option<Bytes> + Send + Sync>,
 }
 
 /// Receive side: [`recv`](BodyForkReceiver::recv) drains all queued chunks.
@@ -69,15 +75,17 @@ pub struct BodyForkReceiver {
     inner: Arc<BodyForkShared>,
 }
 
+pub struct BodyMultiForkSender {
+    mapper: Box<dyn Fn(Bytes) -> Option<Bytes> + Send + Sync>,
+    senders: Mutex<Vec<BodyForkSender>>,
+}
+
 /// Create a bounded body fork pair with an owned-chunk mapper.
 ///
 /// The mapper runs before queue admission. Returning [`None`] rejects the chunk with
 /// [`BodyForkPushError::Rejected`]. A successfully mapped chunk that cannot be queued is dropped
 /// before [`BodyForkPushError::Full`] is returned.
-pub fn body_fork_pair_with<F>(max_chunks: usize, mapper: F) -> (BodyForkSender, BodyForkReceiver)
-where
-    F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
-{
+pub fn body_fork_pair_with(max_chunks: usize) -> (BodyForkSender, BodyForkReceiver) {
     let inner = Arc::new(BodyForkShared {
         max_chunks,
         state: Mutex::new(BodyForkState::Open(VecDeque::new())),
@@ -86,20 +94,74 @@ where
     (
         BodyForkSender {
             inner: inner.clone(),
-            mapper: Box::new(mapper),
         },
         BodyForkReceiver { inner },
     )
 }
 
+pub fn body_multi_fork_pair_with<F>(
+    max_chunks: usize,
+    forks: usize,
+    mapper: F,
+) -> (BodyMultiForkSender, Vec<BodyForkReceiver>)
+where
+    F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+{
+    assert!(forks > 0, "at least one fork is required");
+    let (senders, receivers) = (0..forks).map(|_| body_fork_pair_with(max_chunks)).unzip();
+    (
+        BodyMultiForkSender {
+            mapper: Box::new(mapper),
+            senders: Mutex::new(senders),
+        },
+        receivers,
+    )
+}
+
+impl BodyMultiForkSender {
+    /// Tries to push the same chunk of bytes to all forks, calling the mapping function once before pushing.
+    pub fn try_push(&self, chunk: Bytes) -> Result<Vec<BodyForkPushError>, BodyMultiForkPushError> {
+        let mut senders = self.senders.lock();
+        let chunk = (self.mapper)(chunk).ok_or(BodyMultiForkPushError::Rejected)?;
+        if chunk.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut errs = Vec::new();
+        let remaining_senders = senders
+            .drain(..)
+            .filter_map(|sender| {
+                let res = sender.try_push(chunk.clone());
+                match res {
+                    Ok(_) => Some(sender),
+                    Err(e) => {
+                        errs.push(e);
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        *senders = remaining_senders;
+
+        if senders.is_empty() {
+            Err(BodyMultiForkPushError::AllErrored(errs))
+        } else {
+            Ok(errs)
+        }
+    }
+
+    /// Finishes all forks.
+    pub fn finish(self) {
+        let mut senders = self.senders.lock();
+        for sender in senders.drain(..) {
+            sender.finish();
+        }
+    }
+}
+
 impl BodyForkSender {
     /// Try to map and queue a body chunk.
     pub fn try_push(&self, chunk: Bytes) -> Result<(), BodyForkPushError> {
-        let chunk = (self.mapper)(chunk).ok_or(BodyForkPushError::Rejected)?;
-        if chunk.is_empty() {
-            return Ok(());
-        }
-
         let mut g = self.inner.state.lock();
         let pending = match &mut *g {
             BodyForkState::Open(pending) => pending,
@@ -210,7 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_finish_recv() {
-        let (tx, mut rx) = body_fork_pair_with(32, Some);
+        let (tx, mut rx) = body_fork_pair_with(32);
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"bc")).unwrap();
         tx.finish();
@@ -220,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_chunks_rejects_push() {
-        let (tx, mut rx) = body_fork_pair_with(2, Some);
+        let (tx, mut rx) = body_fork_pair_with(2);
         tx.try_push(Bytes::from_static(b"ab")).unwrap();
         tx.try_push(Bytes::from_static(b"cd")).unwrap();
         assert_eq!(
@@ -234,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn recv_frees_capacity() {
-        let (tx, mut rx) = body_fork_pair_with(2, Some);
+        let (tx, mut rx) = body_fork_pair_with(2);
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"b")).unwrap();
         assert_eq!(
@@ -253,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_without_finish_clears_bytes() {
-        let (tx, mut rx) = body_fork_pair_with(32, Some);
+        let (tx, mut rx) = body_fork_pair_with(32);
         tx.try_push(Bytes::from_static(b"x")).unwrap();
         drop(tx);
         assert_eq!(rx.recv().await, Err(BodyForkAborted));
@@ -261,14 +323,14 @@ mod tests {
 
     #[tokio::test]
     async fn finish_empty_body() {
-        let (tx, mut rx) = body_fork_pair_with(32, Some);
+        let (tx, mut rx) = body_fork_pair_with(32);
         tx.finish();
         assert_eq!(rx.recv().await, Ok(None));
     }
 
     #[tokio::test]
     async fn recv_returns_available_without_waiting_for_end() {
-        let (tx, mut rx) = body_fork_pair_with(32, Some);
+        let (tx, mut rx) = body_fork_pair_with(32);
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         tx.try_push(Bytes::from_static(b"b")).unwrap();
         let chunks = rx.recv().await.unwrap().unwrap();
@@ -278,6 +340,49 @@ mod tests {
         tx.finish();
         assert_eq!(flatten(rx.recv().await.unwrap().unwrap()), b"z");
         assert!(rx.recv().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn multi_fork_partial_failure_keeps_healthy_fork() {
+        let (tx, mut receivers) = body_multi_fork_pair_with(1, 2, Some);
+        let mut healthy = receivers.remove(0);
+        let mut stalled = receivers.remove(0);
+
+        assert!(tx.try_push(Bytes::from_static(b"a")).unwrap().is_empty());
+        assert_eq!(flatten(healthy.recv().await.unwrap().unwrap()), b"a");
+
+        assert_eq!(
+            tx.try_push(Bytes::from_static(b"b")),
+            Ok(vec![BodyForkPushError::Full])
+        );
+        assert_eq!(stalled.recv().await, Err(BodyForkAborted));
+        assert_eq!(flatten(healthy.recv().await.unwrap().unwrap()), b"b");
+
+        tx.finish();
+        assert_eq!(healthy.recv().await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn multi_fork_errors_when_last_healthy_fork_fails() {
+        let (tx, mut receivers) = body_multi_fork_pair_with(1, 2, Some);
+        let mut healthy = receivers.remove(0);
+        let mut stalled = receivers.remove(0);
+
+        assert!(tx.try_push(Bytes::from_static(b"a")).unwrap().is_empty());
+        assert_eq!(flatten(healthy.recv().await.unwrap().unwrap()), b"a");
+        assert_eq!(
+            tx.try_push(Bytes::from_static(b"b")),
+            Ok(vec![BodyForkPushError::Full])
+        );
+
+        assert_eq!(
+            tx.try_push(Bytes::from_static(b"c")),
+            Err(BodyMultiForkPushError::AllErrored(vec![
+                BodyForkPushError::Full
+            ]))
+        );
+        assert_eq!(healthy.recv().await, Err(BodyForkAborted));
+        assert_eq!(stalled.recv().await, Err(BodyForkAborted));
     }
 
     struct TrackedBytes {
@@ -312,39 +417,38 @@ mod tests {
 
     #[tokio::test]
     async fn mapper_rejection_aborts_when_sender_is_dropped() {
-        let (tx, mut rx) = body_fork_pair_with(32, |_| None);
+        let (tx, mut receivers) = body_multi_fork_pair_with(32, 1, |_| None);
+        let mut rx = receivers.pop().unwrap();
         assert_eq!(
             tx.try_push(Bytes::from_static(b"rejected")),
-            Err(BodyForkPushError::Rejected)
+            Err(BodyMultiForkPushError::Rejected)
         );
         drop(tx);
         assert_eq!(rx.recv().await, Err(BodyForkAborted));
     }
 
     #[tokio::test]
-    async fn full_drops_mapped_chunk_immediately() {
+    async fn full_drops_failed_fork_bytes_immediately() {
         let live_bytes = Arc::new(AtomicUsize::new(0));
-        let (tx, mut rx) = body_fork_pair_with(1, tracked_mapper(live_bytes.clone()));
+        let (tx, mut rx_vec) = body_multi_fork_pair_with(1, 1, tracked_mapper(live_bytes.clone()));
+        let mut rx = rx_vec.pop().expect("expected one fork");
 
         tx.try_push(Bytes::from_static(b"a")).unwrap();
         assert_eq!(live_bytes.load(Ordering::SeqCst), 1);
         assert_eq!(
             tx.try_push(Bytes::from_static(b"bc")),
-            Err(BodyForkPushError::Full)
+            Err(BodyMultiForkPushError::AllErrored(vec![
+                BodyForkPushError::Full
+            ]))
         );
         assert_eq!(
             live_bytes.load(Ordering::SeqCst),
-            1,
-            "the mapped chunk rejected by queue admission must be dropped"
+            0,
+            "aborting the failed fork must drop its queued and rejected chunks"
         );
 
         tx.finish();
-        let Some(chunks) = rx.recv().await.unwrap() else {
-            panic!("expected queued chunk");
-        };
-        drop(chunks);
-        assert_eq!(live_bytes.load(Ordering::SeqCst), 0);
-        assert_eq!(rx.recv().await, Ok(None));
+        assert_eq!(rx.recv().await, Err(BodyForkAborted));
     }
 
     #[tokio::test]
@@ -352,8 +456,9 @@ mod tests {
         const CHUNKS_PER_BATCH: usize = 32;
 
         let live_bytes = Arc::new(AtomicUsize::new(0));
-        let (tx, mut rx) =
-            body_fork_pair_with(CHUNKS_PER_BATCH, tracked_mapper(live_bytes.clone()));
+        let (tx, mut rx_vec) =
+            body_multi_fork_pair_with(CHUNKS_PER_BATCH, 1, tracked_mapper(live_bytes.clone()));
+        let mut rx = rx_vec.pop().expect("expected one fork");
 
         for _ in 0..CHUNKS_PER_BATCH {
             tx.try_push(Bytes::from_static(b"x")).unwrap();
@@ -383,7 +488,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_wait_is_persistent() {
-        let (tx, mut rx) = body_fork_pair_with(1, Some);
+        let (tx, mut rx) = body_fork_pair_with(1);
         tx.try_push(Bytes::from_static(b"x")).unwrap();
         let Some(batch) = rx.recv().await.unwrap() else {
             panic!("expected queued chunk");

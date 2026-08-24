@@ -32,10 +32,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
+use crate::protocols::http::body_fork::{body_multi_fork_pair_with, BodyMultiForkSender};
 use crate::protocols::http::{
-    body_buffer::FixedBuffer,
-    body_fork::{body_fork_pair_with, BodyForkReceiver, BodyForkSender},
-    date, HttpTask,
+    body_buffer::FixedBuffer, body_fork::BodyForkReceiver, date, HttpTask,
 };
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
@@ -91,7 +90,7 @@ pub struct HttpSession {
     /// after this session ends
     keepalive_reuses_remaining: Option<u32>,
     /// Optional lossy tee of request body bytes (see [`Self::attach_request_body_fork`]).
-    body_fork: Option<BodyForkSender>,
+    body_fork: Option<BodyMultiForkSender>,
 }
 
 impl HttpSession {
@@ -475,18 +474,19 @@ impl HttpSession {
     ///
     /// The mapper runs for every forked chunk before queue admission. Returning [`None`] aborts
     /// only the fork; the primary request continues with its original chunk.
-    pub fn attach_request_body_fork_with<F>(
+    pub fn attach_request_body_multi_fork_with<F>(
         &mut self,
         max_chunks: usize,
+        forks: usize,
         mapper: F,
-    ) -> Option<BodyForkReceiver>
+    ) -> Option<Vec<BodyForkReceiver>>
     where
         F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
     {
         if self.body_fork.is_some() {
             return None;
         }
-        let (tx, rx) = body_fork_pair_with(max_chunks, mapper);
+        let (tx, rx) = body_multi_fork_pair_with(max_chunks, forks, mapper);
         self.body_fork = Some(tx);
         Some(rx)
     }
@@ -1488,7 +1488,10 @@ mod tests_stream {
         let mock_io = Builder::new().read(&input[..]).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
-        let mut fork = http_stream.attach_request_body_fork_with(1, Some).unwrap();
+        let mut forks = http_stream
+            .attach_request_body_multi_fork_with(1, 1, Some)
+            .unwrap();
+        let mut fork = forks.pop().expect("expected one fork");
 
         let body = http_stream.read_body_bytes().await.unwrap().unwrap();
         assert_eq!(body, b"abc".as_slice());

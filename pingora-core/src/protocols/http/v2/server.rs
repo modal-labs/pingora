@@ -30,7 +30,9 @@ use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
-use crate::protocols::http::body_fork::{body_fork_pair_with, BodyForkReceiver, BodyForkSender};
+use crate::protocols::http::body_fork::{
+    body_multi_fork_pair_with, BodyForkReceiver, BodyMultiForkSender,
+};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
@@ -111,7 +113,7 @@ pub struct HttpSession {
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
     /// Optional lossy tee of request body bytes (see [`Self::attach_request_body_fork`]).
-    body_fork: Option<BodyForkSender>,
+    body_fork: Option<BodyMultiForkSender>,
 }
 
 impl HttpSession {
@@ -258,18 +260,19 @@ impl HttpSession {
     ///
     /// The mapper runs for every forked chunk before queue admission. Returning [`None`] aborts
     /// only the fork; the primary request continues with its original chunk.
-    pub fn attach_request_body_fork_with<F>(
+    pub fn attach_request_body_multi_fork_with<F>(
         &mut self,
         max_chunks: usize,
+        forks: usize,
         mapper: F,
-    ) -> Option<BodyForkReceiver>
+    ) -> Option<Vec<BodyForkReceiver>>
     where
         F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
     {
         if self.body_fork.is_some() {
             return None;
         }
-        let (tx, rx) = body_fork_pair_with(max_chunks, mapper);
+        let (tx, rx) = body_multi_fork_pair_with(max_chunks, forks, mapper);
         self.body_fork = Some(tx);
         Some(rx)
     }
@@ -704,7 +707,10 @@ mod test {
             .await
             .unwrap()
             .unwrap();
-        let mut fork = http.attach_request_body_fork_with(1, Some).unwrap();
+        let mut forks = http
+            .attach_request_body_multi_fork_with(1, 1, Some)
+            .unwrap();
+        let mut fork = forks.pop().expect("expected one fork");
 
         let body = http.read_body_bytes().await.unwrap().unwrap();
         assert_eq!(body, b"abc".as_slice());
