@@ -18,6 +18,7 @@ use super::body_fork::BodyForkReceiver;
 use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
+use super::v1::client::http_req_header_to_wire;
 use super::v1::server::HttpSession as SessionV1;
 use super::v2::server::HttpSession as SessionV2;
 use super::HttpTask;
@@ -472,11 +473,20 @@ impl Session {
         }
     }
 
+    /// Serialize the request header into HTTP/1.x wire format.
+    ///
+    /// This serializes the parsed request header including any mutations 
+    /// made by filters, rather than the raw bytes as read from the wire. 
+    /// Whitespace is normalized.
     pub fn to_h1_raw(&self) -> Bytes {
         match self {
-            Self::H1(s) => s.get_headers_raw_bytes(),
+            Self::H1(s) => http_req_header_to_wire(s.req_header())
+                .expect("h1 request header always has a known version")
+                .freeze(),
             Self::H2(s) => s.pseudo_raw_h1_request_header(),
-            Self::Subrequest(s) => s.get_headers_raw_bytes(),
+            Self::Subrequest(s) => http_req_header_to_wire(s.req_header())
+                .expect("subrequest header always has a known version")
+                .freeze(),
             Self::Custom(c) => c.pseudo_raw_h1_request_header(),
         }
     }
