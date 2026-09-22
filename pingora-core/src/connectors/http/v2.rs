@@ -160,11 +160,10 @@ impl ConnectionRef {
         // The advertised value is only known once the server's initial
         // SETTINGS frame has been processed (until then h2 reports the
         // client-side initial value), so it must be re-read on every
-        // admission rather than snapshotted at handshake: a server that
-        // advertises fewer streams than max_streams would otherwise have
-        // excess requests silently queued inside h2 — parked until a
-        // long-lived stream finishes — instead of signaling the caller to
-        // dial another connection.
+        // admission rather than snapshotted at handshake. This fixes the 
+        // behavior where a server that advertises fewer than max_streams
+        // receives excess requests queued inside h2 and parked
+        // until other streams finish instead of requiring a new connection.
         let max_streams = self
             .0
             .max_streams
