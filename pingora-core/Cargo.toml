@@ -1,6 +1,6 @@
 [package]
 name = "pingora-core"
-version = "0.8.0"
+version = "0.9.0"
 authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
 license = "Apache-2.0"
 edition = "2021"
@@ -19,19 +19,20 @@ name = "pingora_core"
 path = "src/lib.rs"
 
 [dependencies]
-pingora-runtime = { version = "0.8.0", path = "../pingora-runtime" }
-pingora-openssl = { version = "0.8.0", path = "../pingora-openssl", optional = true }
-pingora-boringssl = { version = "0.8.0", path = "../pingora-boringssl", optional = true }
-pingora-pool = { version = "0.8.0", path = "../pingora-pool" }
-pingora-error = { version = "0.8.0", path = "../pingora-error" }
-pingora-timeout = { version = "0.8.0", path = "../pingora-timeout" }
-pingora-http = { version = "0.8.0", path = "../pingora-http" }
-pingora-rustls = { version = "0.8.0", path = "../pingora-rustls", optional = true }
-pingora-s2n = { version = "0.8.0", path = "../pingora-s2n", optional = true }
+pingora-runtime = { version = "0.9.0", path = "../pingora-runtime" }
+pingora-openssl = { version = "0.9.0", path = "../pingora-openssl", optional = true }
+pingora-boringssl = { version = "0.9.0", path = "../pingora-boringssl", optional = true }
+pingora-pool = { version = "0.9.0", path = "../pingora-pool" }
+pingora-error = { version = "0.9.0", path = "../pingora-error" }
+pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
+pingora-http = { version = "0.9.0", path = "../pingora-http" }
+pingora-rustls = { version = "0.9.0", path = "../pingora-rustls", optional = true }
+pingora-s2n = { version = "0.9.0", path = "../pingora-s2n", optional = true }
 bstr = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tokio-stream = { workspace = true }
-futures = "0.3"
+tokio-util = { workspace = true, optional = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 httparse = { workspace = true }
 bytes = { workspace = true }
@@ -47,7 +48,6 @@ strum = "0.26.2"
 strum_macros = "0.26.2"
 libc = "0.2.70"
 chrono = { version = "~0.4.31", features = ["alloc"], default-features = false }
-prometheus = "0.13"
 sentry = { version = "0.36", features = [
     "backtrace",
     "contexts",
@@ -75,35 +75,55 @@ lru = { workspace = true, optional = true }
 daggy = "0.8"
 
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.5.0"
-nix = "~0.24.3"
+flurry = "0.5"
+daemonix = "0.1.0"
+nix = { version = "~0.31.1", features = ["socket", "net", "fs", "uio"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio"] }
 h2 = { workspace = true, features = ["unstable"] }
 tokio-stream = { version = "0.1", features = ["full"] }
 env_logger = "0.11"
-reqwest = { version = "0.11", features = [
+reqwest = { version = "0.12", features = [
     "rustls-tls",
+    "http2",
 ], default-features = false }
-hyper = "0.14"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
 rstest = "0.23.0"
-rustls = "0.23"
+# Only used for types in tests; the crypto provider arrives through
+# pingora-rustls, so no provider feature is selected here.
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "std",
+    "tls12",
+] }
+
+[[bench]]
+name = "h1_pipelining"
+harness = false
 
 [target.'cfg(unix)'.dev-dependencies]
-hyperlocal = "0.8"
-jemallocator = "0.5"
+hyperlocal = "0.9"
+# Match foundations' allocator so workspace all-features tests link one jemalloc.
+jemallocator = { package = "tikv-jemallocator", version = "0.6" }
 
 [features]
 default = []
+# Requires building with `--cfg tokio_unstable`.
+dial9 = ["pingora-runtime/dial9"]
+dial9-worker-s3 = ["dial9", "pingora-runtime/dial9-worker-s3"]
+dial9-cpu-profiling = ["dial9", "pingora-runtime/dial9-cpu-profiling"]
 openssl = ["pingora-openssl", "openssl_derived"]
 boringssl = ["pingora-boringssl", "openssl_derived"]
 rustls = ["pingora-rustls", "any_tls", "dep:x509-parser", "ouroboros"]
 s2n = ["pingora-s2n", "any_tls", "dep:x509-parser", "ouroboros", "lru"]
 patched_http1 = ["pingora-http/patched_http1"]
 openssl_derived = ["any_tls"]
-any_tls = []
+any_tls = ["dep:tokio-util"]
 sentry = ["dep:sentry"]
 connection_filter = []

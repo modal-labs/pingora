@@ -146,11 +146,23 @@ pub fn clear_error_stack() {
     let _ = ErrorStack::get();
 }
 
-/// Create a new [Ssl] from &[SslAcceptor]
+/// Export keying material from a TLS connection
 ///
-/// This function is needed because [Ssl::new()] doesn't take `&SslContextRef` like openssl-rs
+/// Derives keying material for application use in accordance with RFC 5705.
+///
+/// See [SSL_export_keying_material](https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_export_keying_material).
+pub fn ssl_export_keying_material(
+    ssl: &SslRef,
+    out: &mut [u8],
+    label: &str,
+    context: Option<&[u8]>,
+) -> Result<(), ErrorStack> {
+    ssl.export_keying_material(out, label, context)
+}
+
+/// Create a new [`Ssl`] from &[`SslAcceptor`]
 pub fn ssl_from_acceptor(acceptor: &SslAcceptor) -> Result<Ssl, ErrorStack> {
-    Ssl::new_from_ref(acceptor.context())
+    Ssl::new(acceptor.context())
 }
 
 /// Suspend the TLS handshake when a certificate is needed.

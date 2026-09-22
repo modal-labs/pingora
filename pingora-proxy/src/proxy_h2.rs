@@ -20,83 +20,145 @@ use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_cache::CachePhase;
+use pingora_core::protocols::http::authority::{
+    raw_target_authority, validate_request_authority, RawTargetAuthority,
+};
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
 
-// add scheme and authority as required by h2 lib
-fn update_h2_scheme_authority(
-    header: &mut http::request::Parts,
-    raw_host: &[u8],
-    tls: bool,
-) -> Result<()> {
-    let authority = if let Ok(s) = std::str::from_utf8(raw_host) {
-        if s.starts_with('[') {
-            // don't mess with ipv6 host
-            s
-        } else if let Some(colon) = s.find(':') {
-            if s.len() == colon + 1 {
-                // colon is the last char, ignore
-                s
-            } else if let Some(another_colon) = s[colon + 1..].find(':') {
-                // try to get rid of extra port numbers
-                &s[..colon + 1 + another_colon]
-            } else {
-                s
-            }
-        } else {
-            s
-        }
-    } else {
+/// Derive H2 `:path`, separating H1 absolute-form components ([RFC 9113 section 8.3.1]).
+///
+/// Reclassifies after filters and rejects non-UTF-8 or ambiguous targets.
+///
+/// [RFC 9113 section 8.3.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.1
+fn h2_path_and_query(header: &RequestHeader) -> Result<http::uri::PathAndQuery> {
+    let target = header.raw_path();
+    if !header.raw_path_is_utf8() {
         return Error::e_explain(
             InvalidHTTPHeader,
-            format!("invalid authority from host {:?}", raw_host),
+            "non-UTF-8 request target cannot be forwarded over HTTP/2",
         );
+    }
+    let Some(uri_path_and_query) = header.uri.path_and_query() else {
+        return Ok(http::uri::PathAndQuery::from_static("/"));
     };
+    // Preserve origin-form and the server-wide `OPTIONS *` asterisk-form (RFC 9112 section 3.2.4).
+    // https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2.4
+    if target.starts_with(b"/") || target == b"*" {
+        return Ok(uri_path_and_query.clone());
+    }
+
+    // Origin-form and asterisk-form returned above; classify the remainder to extract an H1
+    // absolute-form path/query or reject ambiguous authority syntax.
+    let absolute_path_and_query = match raw_target_authority(target) {
+        RawTargetAuthority::None => return Ok(uri_path_and_query.clone()),
+        RawTargetAuthority::AmbiguousAuthority => {
+            return Error::e_explain(
+                InvalidHTTPHeader,
+                "ambiguous HTTP absolute-form request target",
+            )
+        }
+        RawTargetAuthority::Absolute { path_and_query, .. } => path_and_query,
+    };
+    if absolute_path_and_query.is_empty() {
+        return Ok(http::uri::PathAndQuery::from_static("/"));
+    }
+    if absolute_path_and_query.first() == Some(&b'?') {
+        let mut origin_form = Vec::with_capacity(absolute_path_and_query.len() + 1);
+        origin_form.push(b'/');
+        origin_form.extend_from_slice(absolute_path_and_query);
+        return http::uri::PathAndQuery::try_from(origin_form).or_err(
+            InvalidHTTPHeader,
+            "invalid query in absolute-form request target",
+        );
+    }
+    http::uri::PathAndQuery::try_from(absolute_path_and_query).or_err(
+        InvalidHTTPHeader,
+        "invalid path in absolute-form request target",
+    )
+}
+
+fn update_h2_scheme_authority(
+    header: &mut RequestHeader,
+    raw_host: &[u8],
+    tls: bool,
+    path_and_query: http::uri::PathAndQuery,
+) -> Result<()> {
+    let authority = http::uri::Authority::try_from(raw_host).map_err(|cause| {
+        Error::because(
+            InvalidHTTPHeader,
+            format!("invalid authority from Host {raw_host:?}"),
+            cause,
+        )
+    })?;
+    // Last guard before this authority is serialized on the wire.
+    if authority.as_str().contains('@') {
+        return Error::e_explain(InvalidHTTPHeader, "userinfo in Host header");
+    }
 
     let scheme = if tls { "https" } else { "http" };
     let uri = http::uri::Builder::new()
         .scheme(scheme)
         .authority(authority)
-        .path_and_query(header.uri.path_and_query().as_ref().unwrap().as_str())
+        .path_and_query(path_and_query)
         .build();
     match uri {
         Ok(uri) => {
-            header.uri = uri;
+            header.set_uri(uri);
             Ok(())
         }
         Err(_) => Error::e_explain(
             InvalidHTTPHeader,
-            format!("invalid authority from host {}", authority),
+            format!("failed to build H2 URI from Host {raw_host:?}"),
         ),
     }
 }
 
-impl<SV, C> HttpProxy<SV, C>
+impl<SV, C, DS> HttpProxy<SV, C, DS>
 where
     C: custom::Connector,
+    DS: DownstreamSession,
 {
     pub(crate) async fn proxy_down_to_up(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_session: &mut Http2Session,
         peer: &HttpPeer,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, Option<Box<Error>>)
     // (reuse_server, error)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         let mut req = session.req_header().clone();
+        let authority_policy = AuthorityPolicy::from(session.downstream_session.is_custom());
 
-        if req.version != Version::HTTP_2 {
+        // A patched HTTP/1 parser can preserve non-UTF-8 request-target bytes, but `http::Uri`,
+        // which the H2 client API requires, cannot represent them. Reject client input as a
+        // downstream error before a filter has a chance to mutate the target. This wire-format
+        // constraint applies to both standard and custom downstream authority policies.
+        if !req.raw_path_is_utf8() {
+            let e = Error::explain(
+                InvalidHTTPHeader,
+                "non-UTF-8 request target cannot be forwarded over HTTP/2",
+            );
+            return (false, Some(e.into_down()));
+        }
+
+        if req.version != Version::HTTP_2 || authority_policy.is_custom() {
+            if let Err(e) =
+                sanitize_h2_upstream_request(&mut req, peer.options.http_upstream_request_policy)
+            {
+                return (false, Some(e.into_down()));
+            }
             /* remove H1 specific headers */
             // https://github.com/hyperium/h2/blob/d3b9f1e36aadc1a7a6804e2f8e86d3fe4a244b4f/src/proto/streams/send.rs#L72
             req.remove_header(&http::header::TRANSFER_ENCODING);
             req.remove_header(&http::header::CONNECTION);
             req.remove_header(&http::header::UPGRADE);
-            req.remove_header("keep-alive");
-            req.remove_header("proxy-connection");
+            req.remove_header(KEEP_ALIVE);
+            req.remove_header(PROXY_CONNECTION);
         }
 
         /* turn it into h2 */
@@ -121,6 +183,43 @@ where
             }
         }
 
+        if authority_policy.is_standard() {
+            if let Err(e) = reconcile_upstream_authority(&mut req) {
+                return (false, Some(e.into_in()));
+            }
+            if let Err(e) = validate_request_authority(&req) {
+                // The final filter-produced request is invalid, so classify this as internal.
+                return (false, Some(e.into_in()));
+            }
+        }
+
+        // A Host-less H1 absolute-form request still needs H2 :authority. Copy its raw target
+        // authority into local storage without inserting a temporary Host header.
+        let raw_authority =
+            if req.headers.get(http::header::HOST).is_none() && authority_policy.is_standard() {
+                raw_target_authority(req.raw_path())
+                    .authority()
+                    .map(<[u8]>::to_owned)
+            } else {
+                None
+            };
+        if req.headers.get(http::header::HOST).is_none()
+            && req.uri.authority().is_none()
+            && raw_authority.is_none()
+        {
+            // The final filter-produced request has no authority source.
+            let e = Error::explain(InvalidHTTPHeader, "no authority for H2 upstream request");
+            return (false, Some(e.into_in()));
+        }
+
+        // Run for every request, including Host-less HTTP/1.0, before conversion to
+        // `http::request::Parts` discards RequestHeader's raw byte fallback. A failure here after
+        // the initial check was produced by a filter and is therefore internal.
+        let path_and_query = match h2_path_and_query(&req) {
+            Ok(path_and_query) => path_and_query,
+            Err(e) => return (false, Some(e.into_in())),
+        };
+
         // Remove H1 `Host` header, save it in order to add to :authority
         // We do this because certain H2 servers expect request not to have a host header.
         // The `Host` is removed after the upstream filters above for 2 reasons
@@ -134,14 +233,20 @@ where
         // whether we support sending END_STREAM on HEADERS if body is empty
         let send_end_stream = req.send_end_stream().expect("req must be h2");
 
-        let mut req: http::request::Parts = req.into();
-
-        // H2 requires authority to be set, so copy that from H1 host if that is set
-        if let Some(host) = host {
-            if let Err(e) = update_h2_scheme_authority(&mut req, host.as_bytes(), peer.is_tls()) {
+        // Host is consumed locally to build :authority and is never sent on the H2 wire.
+        let authority = host
+            .as_ref()
+            .map(|host| host.as_bytes())
+            .or(raw_authority.as_deref());
+        if let Some(authority) = authority {
+            if let Err(e) =
+                update_h2_scheme_authority(&mut req, authority, peer.is_tls(), path_and_query)
+            {
                 return (false, Some(e));
             }
         }
+
+        let req: http::request::Parts = req.into();
 
         debug!("Request to h2: {req:?}");
 
@@ -170,6 +275,14 @@ where
             .downstream_session
             .as_custom_mut()
             .and_then(|c| c.take_custom_message_writer());
+        // Keep the reader in this caller so it is restored even if retryable
+        // upstream errors make try_join! cancel the downstream future.
+        let mut downstream_custom_message_reader = match session
+            .take_downstream_custom_message_reader(&mut downstream_custom_message_writer)
+        {
+            Ok(reader) => reader,
+            Err(e) => return (false, Some(e)),
+        };
 
         // take the body writer out of the client for easy duplex
         let mut client_body = client_session
@@ -184,6 +297,10 @@ where
 
         session.as_mut().enable_retry_buffering();
 
+        // Shared signal so the upstream half can distinguish an expected task-pipe
+        // closure (the downstream half finished and dropped rx) from an unexpected one.
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+
         /* read downstream body and upstream response at the same time */
 
         let ret = tokio::try_join!(
@@ -193,9 +310,11 @@ where
                 rx,
                 ctx,
                 write_timeout,
-                &mut downstream_custom_message_writer
+                &mut downstream_custom_message_writer,
+                &mut downstream_custom_message_reader,
+                pipe_state.clone(),
             ),
-            pipe_up_to_down_response(client_session, tx)
+            pipe_up_to_down_response(client_session, tx, pipe_state)
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
@@ -208,16 +327,35 @@ where
                     }
                 }
             }
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                match custom_session.restore_custom_message_reader(downstream_custom_message_reader)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, Some(e));
+                    }
+                }
+            }
         }
 
         match ret {
             Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
             Err(e) => {
+                let upstream_read_timeout =
+                    e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout);
+                let downstream_error = e.esource == ErrorSource::Downstream;
                 // On application level upstream read timeouts, send RST_STREAM CANCEL,
-                // we know we have not received END_STREAM at this point since we read timed out
+                // we know we have not received END_STREAM at this point since we read timed out.
+                // Also cancel the upstream stream when downstream goes away/resets so the
+                // upstream peer can release the stream promptly.
                 // TODO: implement for write timeouts?
-                if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
+                if upstream_read_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
+                    if upstream_read_timeout {
+                        // Mark the underlying H2 connection for shutdown so it's not used
+                        // for new streams in case it is hung.
+                        client_session.conn.mark_shutdown();
+                    }
                 }
                 (false, Some(e))
             }
@@ -226,15 +364,15 @@ where
 
     pub(crate) async fn proxy_to_h2_upstream(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_session: &mut Http2Session,
         reused: bool,
         peer: &HttpPeer,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
     ) -> (bool, Option<Box<Error>>)
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         #[cfg(windows)]
         let raw = client_session.fd() as std::os::windows::io::RawSocket;
@@ -262,19 +400,109 @@ where
         (server_session_reuse, error)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn process_upstream_tasks_h2(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+        initial_task: HttpTask,
+        rx: &mut mpsc::Receiver<HttpTask>,
+        serve_from_cache: &mut ServeFromCache,
+        range_body_filter: &mut proxy_cache::range_filter::RangeBodyFilter,
+        response_state: &mut ResponseStateMachine,
+    ) -> Result<Option<bool>>
+    where
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+    {
+        if serve_from_cache.should_discard_upstream() {
+            // Serving the cached response and discarding the upstream one; nothing
+            // is written downstream this round, so return None and let the caller
+            // continue.
+            return Ok(None);
+        }
+
+        // Batch: pull as many tasks as we can from rx
+        let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
+        tasks.push(initial_task);
+        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
+        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
+            if let Some(t) = maybe_task {
+                tasks.push(t);
+            } else {
+                break; // upstream closed
+            }
+        }
+
+        /* run filters before sending to downstream */
+        let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
+        for mut t in tasks {
+            if self.revalidate_or_stale(session, &mut t, ctx).await {
+                serve_from_cache.enable();
+                response_state.enable_cached_response();
+                // skip downstream filtering entirely as the 304 will not be sent
+                break;
+            }
+            #[cfg(feature = "upstream_modules")]
+            if let HttpTask::Header(header, end_of_stream) = &t {
+                self.inner
+                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
+                    .await?;
+            }
+            #[cfg(feature = "upstream_modules")]
+            session.upstream_modules_filter_task(&mut t).await?;
+            session.upstream_compression.response_filter(&mut t);
+            // check error and abort
+            // otherwise the error is surfaced via write_response_tasks()
+            if !serve_from_cache.should_send_to_downstream() {
+                if let HttpTask::Failed(e) = t {
+                    return Err(e);
+                }
+            }
+            filtered_tasks.push(
+                self.h2_response_filter(
+                    session,
+                    t,
+                    ctx,
+                    serve_from_cache,
+                    range_body_filter,
+                    false,
+                )
+                .await?,
+            );
+            if serve_from_cache.is_miss_header() {
+                response_state.enable_cached_response();
+            }
+        }
+
+        if !serve_from_cache.should_send_to_downstream() {
+            // TODO: need to derive response_done from filtered_tasks in case downstream failed already
+            return Ok(None);
+        }
+
+        let response_done = session.write_response_tasks(filtered_tasks).await?;
+
+        Ok(Some(response_done))
+    }
+
     // returns whether server (downstream) session can be reused
+    #[allow(clippy::too_many_arguments)]
     async fn bidirection_down_to_up(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         mut rx: mpsc::Receiver<HttpTask>,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
+        downstream_custom_message_reader: &mut Option<
+            Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+        >,
+        pipe_state: Arc<AtomicU8>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         // setup custom message forwarding, if downstream supports it
         let (
@@ -282,16 +510,16 @@ where
             mut downstream_custom_write,
             downstream_custom_message_custom_forwarding,
             mut downstream_custom_message_inject_rx,
-            mut downstream_custom_message_reader,
         ) = if downstream_custom_message_writer.is_some() {
-            let reader = session.downstream_custom_message()?;
             let (inject_tx, inject_rx) = mpsc::channel::<Bytes>(CUSTOM_MESSAGE_QUEUE_SIZE);
-            (true, true, Some(inject_tx), Some(inject_rx), reader)
+            (true, true, Some(inject_tx), Some(inject_rx))
         } else {
-            (false, false, None, None, None)
+            (false, false, None, None)
         };
 
         if let Some(custom_forwarding) = downstream_custom_message_custom_forwarding {
+            // Custom handles are owned by the caller so an early error here still
+            // lets the caller restore them before retrying another upstream.
             self.inner
                 .custom_forwarding(session, ctx, None, custom_forwarding)
                 .await?;
@@ -318,6 +546,8 @@ where
         // use cache when upstream revalidates (or TODO: error)
         let mut serve_from_cache = ServeFromCache::new();
         let mut range_body_filter = proxy_cache::range_filter::RangeBodyFilter::new();
+
+        let mut next_upstream_task: Option<HttpTask> = None;
 
         /* duplex mode
          * see the Same function for h1 for more comments
@@ -356,11 +586,18 @@ where
                             if wait_for_cache_fill {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
-                                warn!(
-                                    "Downstream Error ignored during caching: {}, {}",
-                                    e,
-                                    self.inner.request_summary(session, ctx)
-                                );
+                                if !self.inner.suppress_proxy_warn_log(
+                                    session,
+                                    ctx,
+                                    &e,
+                                    ProxyWarnLogContext::DownstreamCache,
+                                ) {
+                                    warn!(
+                                        "Downstream Error ignored during caching: {}, {}",
+                                        e,
+                                        self.inner.request_summary(session, ctx)
+                                    );
+                                }
                                 // This will not be treated as a final error, but we should signal to
                                 // downstream session regardless
                                 session.downstream_session.on_proxy_failure(e);
@@ -375,6 +612,35 @@ where
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
+                        Err(e) if e.esource == ErrorSource::Downstream => {
+                            // Downstream reset/errored while the upstream write was blocked
+                            // (e.g. on upstream flow control). Same policy as the read error
+                            // handling above: ignore the downstream error if the upstream
+                            // response is being admitted to cache, otherwise fail so the
+                            // downstream stream handles are dropped promptly.
+                            let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
+                                || serve_from_cache.is_miss();
+                            if !wait_for_cache_fill {
+                                return Err(e);
+                            }
+                            // ignore downstream error so that upstream can continue to write cache
+                            downstream_state.to_errored();
+                            if !self.inner.suppress_proxy_warn_log(
+                                session,
+                                ctx,
+                                &e,
+                                ProxyWarnLogContext::DownstreamCache,
+                            ) {
+                                warn!(
+                                    "Downstream Error ignored during caching: {}, {}",
+                                    e,
+                                    self.inner.request_summary(session, ctx)
+                                );
+                            }
+                            // This will not be treated as a final error, but we should signal to
+                            // downstream session anyway.
+                            session.downstream_session.on_proxy_failure(e);
+                        },
                         Err(e) => {
                             // mark request done, attempt to drain receive
                             warn!("Upstream h2 body send error: {e}");
@@ -385,57 +651,47 @@ where
                     };
                 },
 
-                task = rx.recv(), if !response_state.upstream_done() => {
+                // Handle buffered upstream task from previous iteration
+                task = async { next_upstream_task.take() }, if next_upstream_task.is_some() => {
+                    debug!("buffered upstream event: {:?}", task);
                     if let Some(t) = task {
-                        debug!("upstream event: {:?}", t);
-                        if serve_from_cache.should_discard_upstream() {
-                            // just drain, do we need to do anything else?
-                           continue;
-                        }
-                        // pull as many tasks as we can
-                        let mut tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-                        tasks.push(t);
-                        // tokio::task::unconstrained because now_or_never may yield None when the future is ready
-                        while let Some(maybe_task) = tokio::task::unconstrained(rx.recv()).now_or_never() {
-                            if let Some(t) = maybe_task {
-                                tasks.push(t);
-                            } else {
-                                break
-                            }
-                        }
-
-                        /* run filters before sending to downstream */
-                        let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-                        for mut t in tasks {
-                            if self.revalidate_or_stale(session, &mut t, ctx).await {
-                                serve_from_cache.enable();
-                                response_state.enable_cached_response();
-                                // skip downstream filtering entirely as the 304 will not be sent
-                                break;
-                            }
-                            session.upstream_compression.response_filter(&mut t);
-                            // check error and abort
-                            // otherwise the error is surfaced via write_response_tasks()
-                            if !serve_from_cache.should_send_to_downstream() {
-                                if let HttpTask::Failed(e) = t {
-                                    return Err(e);
-                                }
-                            }
-                            filtered_tasks.push(
-                                self.h2_response_filter(session, t, ctx,
-                                    &mut serve_from_cache,
-                                    &mut range_body_filter, false).await?);
-                            if serve_from_cache.is_miss_header() {
-                                response_state.enable_cached_response();
-                            }
-                        }
-
-                        if !serve_from_cache.should_send_to_downstream() {
-                            // TODO: need to derive response_done from filtered_tasks in case downstream failed already
+                        let Some(response_done) = self.process_upstream_tasks_h2(
+                            session,
+                            ctx,
+                            t,
+                            &mut rx,
+                            &mut serve_from_cache,
+                            &mut range_body_filter,
+                            &mut response_state,
+                        ).await? else {
+                            // nothing sent downstream e.g. serve_from_cache
                             continue;
+                        };
+                        if session.was_upgraded() {
+                            return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
                         }
+                        response_state.maybe_set_upstream_done(response_done);
+                    } else {
+                        debug!("empty upstream event");
+                        response_state.maybe_set_upstream_done(true);
+                    }
+                },
 
-                        let response_done = session.write_response_tasks(filtered_tasks).await?;
+                task = rx.recv(), if !response_state.upstream_done() && next_upstream_task.is_none() => {
+                    debug!("upstream event: {:?}", task);
+                    if let Some(t) = task {
+                        let Some(response_done) = self.process_upstream_tasks_h2(
+                            session,
+                            ctx,
+                            t,
+                            &mut rx,
+                            &mut serve_from_cache,
+                            &mut range_body_filter,
+                            &mut response_state,
+                        ).await? else {
+                            // nothing sent downstream e.g. serve_from_cache
+                            continue;
+                        };
                         if session.was_upgraded() {
                             // it is very weird if the downstream session decides to upgrade
                             // since the client h2 session cannot, return an error on this case
@@ -446,37 +702,117 @@ where
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);
                     }
-                }
+                },
 
                 task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
-                    if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
+                    if !response_state.cached_done()
+                        && !downstream_state.is_errored()
+                        && serve_from_cache.is_on()
+                        && !session.has_pending_downstream_tasks() => { // backpressure: don't queue if pending writes
+
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true).await?;
                     debug!("serve_from_cache task {task:?}");
 
-                    match session.write_response_tasks(vec![task]).await {
-                        Ok(b) => response_state.maybe_set_cache_done(b),
-                        Err(e) => if serve_from_cache.is_miss() {
-                            // give up writing to downstream but wait for upstream cache write to finish
-                            downstream_state.to_errored();
-                            response_state.maybe_set_cache_done(true);
-                            warn!(
-                                "Downstream Error ignored during caching: {}, {}",
-                                e,
-                                self.inner.request_summary(session, ctx)
-                            );
-                            // This will not be treated as a final error, but we should signal to
-                            // downstream session regardless
-                            session.downstream_session.on_proxy_failure(e);
-                            continue;
-                        } else {
-                            return Err(e);
+                    if session.downstream_session.supports_proxy_task_api() {
+                        session.send_downstream_proxy_task(task).await?;
+                    } else {
+                        match session.write_response_tasks(vec![task]).await {
+                            Ok(b) => response_state.maybe_set_cache_done(b),
+                            Err(e) => if serve_from_cache.is_miss() {
+                                // give up writing to downstream but wait for upstream cache write to finish
+                                downstream_state.to_errored();
+                                response_state.maybe_set_cache_done(true);
+                                if !self.inner.suppress_proxy_warn_log(
+                                    session,
+                                    ctx,
+                                    &e,
+                                    ProxyWarnLogContext::DownstreamCache,
+                                ) {
+                                    warn!(
+                                        "Downstream Error ignored during caching: {}, {}",
+                                        e,
+                                        self.inner.request_summary(session, ctx)
+                                    );
+                                }
+                                // This will not be treated as a final error, but we should signal to
+                                // downstream session regardless
+                                session.downstream_session.on_proxy_failure(e);
+                                continue;
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        // A storage error can disable cache between cached_done
+                        // being set and here; see the same guard in proxy_h1.rs.
+                        if response_state.cached_done() && session.cache.enabled() {
+                            if let Err(e) = session.cache.finish_hit_handler().await {
+                                warn!("Error during finish_hit_handler: {}", e);
+                            }
                         }
                     }
-                    if response_state.cached_done() {
-                        if let Err(e) = session.cache.finish_hit_handler().await {
-                            warn!("Error during finish_hit_handler: {}", e);
+                }
+
+                // Write queued downstream proxy tasks while also polling for upstream tasks.
+                // This allows cache writes to continue even when downstream is stalled.
+                //
+                // "Gate" branch: ready(()) resolves immediately, so the guard controls
+                // whether we enter. This is not a busy-loop because every path through
+                // the inner select either (a) drains all pending tasks via
+                // write_downstream_proxy_tasks (making the guard false), (b) observes a
+                // downstream write error (making downstream_state errored and the guard false),
+                // (c) stores an upstream task in next_upstream_task (making the guard false), or
+                // (d) blocks on real I/O inside the nested select.
+                _ = std::future::ready(()),
+                    if !downstream_state.is_errored()
+                        && session.has_pending_downstream_tasks()
+                        && next_upstream_task.is_none() => {
+                    tokio::select! {
+                        // Try to write downstream proxy tasks (cancel-safe)
+                        write_result = session.write_downstream_proxy_tasks() => {
+                            match write_result {
+                                Ok(end) => {
+                                    response_state.maybe_set_cache_done(end);
+                                    // See disabled() guard comment above.
+                                    // See enabled() guard comment above.
+                                    if response_state.cached_done() && session.cache.enabled() {
+                                        if let Err(e) = session.cache.finish_hit_handler().await {
+                                            warn!("Error during finish_hit_handler: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => if serve_from_cache.is_miss() {
+                                    // give up writing to downstream but wait for upstream cache write to finish
+                                    downstream_state.to_errored();
+                                    response_state.maybe_set_cache_done(true);
+                                    if !self.inner.suppress_proxy_warn_log(
+                                        session,
+                                        ctx,
+                                        &e,
+                                        ProxyWarnLogContext::DownstreamCache,
+                                    ) {
+                                        warn!(
+                                            "Downstream write error ignored during caching: {}, {}",
+                                            e,
+                                            self.inner.request_summary(session, ctx)
+                                        );
+                                    }
+                                    session.downstream_session.on_proxy_failure(e);
+                                } else {
+                                    return Err(e);
+                                }
+                            }
+                        }
+
+                        // Also poll for upstream tasks - if we get one, cancel the write and handle it.
+                        upstream_task = rx.recv(), if !response_state.upstream_done() && serve_from_cache.is_on() && next_upstream_task.is_none() => {
+                            if let Some(t) = upstream_task {
+                                next_upstream_task = Some(t);
+                                continue;
+                            } else {
+                                response_state.maybe_set_upstream_done(true);
+                            }
                         }
                     }
                 }
@@ -523,14 +859,6 @@ where
             }
         }
 
-        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
-                custom_session
-                    .restore_custom_message_reader(downstream_custom_message_reader)
-                    .expect("downstream restore_custom_message_reader should be empty");
-            }
-        }
-
         let mut reuse_downstream = !downstream_state.is_errored();
         if reuse_downstream {
             match session.as_mut().finish_body().await {
@@ -543,21 +871,24 @@ where
                 }
             }
         }
+        // Signal the upstream half that the downstream half completed cleanly before
+        // dropping rx, so a resulting task-pipe closure is treated as benign.
+        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
         Ok(reuse_downstream)
     }
 
     async fn h2_response_filter(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         mut task: HttpTask,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
     ) -> Result<HttpTask>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         if !from_cache {
             if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
@@ -648,7 +979,8 @@ where
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, eos, ctx)?
+                    .response_body_filter(session, &mut data, eos, ctx)
+                    .await?
                 {
                     trace!("delaying downstream response for {duration:?}");
                     time::sleep(duration).await;
@@ -709,16 +1041,16 @@ where
 
     async fn send_body_to2(
         &self,
-        session: &mut Session,
+        session: &mut Session<DS>,
         mut data: Option<Bytes>,
         end_of_body: bool,
         client_body: &mut h2::SendStream<bytes::Bytes>,
-        ctx: &mut SV::CTX,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
     ) -> Result<bool>
     where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
         session
             .downstream_modules_ctx
@@ -736,15 +1068,42 @@ where
             return Ok(false);
         }
 
-        if let Some(data) = data {
-            debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body, write_timeout)
-                .await
-                .map_err(|e| e.into_up())?;
+        let (data, end) = match data {
+            Some(data) => {
+                debug!("Write {} bytes body to h2 upstream", data.len());
+                (data, end_of_body)
+            }
+            None => {
+                debug!("Read downstream body done");
+                /* send a standalone END_STREAM flag */
+                (Bytes::new(), true)
+            }
+        };
+
+        /* For H2 downstreams, race the upstream write against downstream stream
+         * closure. A write blocked on upstream flow control would otherwise keep the
+         * downstream stream handles referenced while a downstream RST_STREAM goes
+         * unobserved, pinning the downstream connection window credit until the
+         * write completes. */
+        if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
+            tokio::select! {
+                biased;
+                res = write_body(client_body, data, end, write_timeout) => {
+                    res.map_err(|e| e.into_up())?;
+                }
+                close_result = stream_close => {
+                    return match close_result {
+                        Ok(reason) => Error::e_explain(
+                            H2Error,
+                            format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
+                        ),
+                        Err(e) => Err(e),
+                    }
+                    .map_err(|e| e.into_down());
+                }
+            }
         } else {
-            debug!("Read downstream body done");
-            /* send a standalone END_STREAM flag */
-            write_body(client_body, Bytes::new(), true, write_timeout)
+            write_body(client_body, data, end, write_timeout)
                 .await
                 .map_err(|e| e.into_up())?;
         }
@@ -757,6 +1116,7 @@ where
 pub(crate) async fn pipe_up_to_down_response(
     client: &mut Http2Session,
     tx: mpsc::Sender<HttpTask>,
+    pipe_state: Arc<AtomicU8>,
 ) -> Result<()> {
     client
         .read_response_header()
@@ -806,12 +1166,25 @@ pub(crate) async fn pipe_up_to_down_response(
         }
     }
 
-    while let Some(chunk) = client
-        .read_response_body()
-        .await
-        .map_err(|e| e.into_up())
-        .transpose()
-    {
+    // Read body from H2 upstream, racing each read against tx.closed().
+    //
+    // When proxying an H2 upstream response with Content-Length to an H1 downstream,
+    // bidirection_down_to_up() may determine the response is complete (all Content-Length
+    // bytes written) and exit before the H2 stream signals END_STREAM. This drops the
+    // receiving end (rx) of the channel. Without this race, read_response_body() would
+    // block until the H2 stream eventually ends (e.g. via trailers or read_timeout),
+    // while the downstream side (which could be H1) is in theory already done.
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            body = client.read_response_body() => {
+                body.map_err(|e| e.into_up()).transpose()
+            }
+            _ = tx.closed() => None,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let data = match chunk {
             Ok(d) => d,
             Err(e) => {
@@ -830,19 +1203,17 @@ pub(crate) async fn pipe_up_to_down_response(
                      * misread as the terminating chunk */
                     continue;
                 }
-                let sent = tx
-                    .send(HttpTask::Body(Some(data), eos))
-                    .await
-                    .or_err(InternalError, "sending h2 body to pipe");
-                // If the if the response with content-length is sent to an HTTP1 downstream,
-                // bidirection_down_to_up() could decide that the body has finished and exit without
-                // waiting for this function to signal the eos. In this case tx being closed is not
-                // an sign of error. It should happen if the only thing left for the h2 to send is
-                // an empty data frame with eos set.
-                if sent.is_err() && eos && empty {
+                // A send failure is benign only when the downstream half signaled it
+                // completed (e.g. an H1 downstream finished by Content-Length before the
+                // H2 stream signaled end-of-stream): stop reading the upstream stream.
+                // Otherwise the closure is unexpected, so surface the original error.
+                let send_result = tx.send(HttpTask::Body(Some(data), eos)).await;
+                if send_result.is_err()
+                    && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+                {
                     return Ok(());
                 }
-                sent?;
+                send_result.or_err(InternalError, "sending h2 body to pipe")?;
             }
             Err(e) => {
                 // Similar to above, push the error to downstream and then quit
@@ -852,52 +1223,171 @@ pub(crate) async fn pipe_up_to_down_response(
         }
     }
 
-    // attempt to get trailers
-    let trailers = match client.read_trailers().await {
-        Ok(t) => t,
-        Err(e) => {
-            // Similar to above, push the error to downstream and then quit
-            let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+    // If the channel is already closed, the downstream half is finished. This
+    // skips trailers/done, but the downstream half has already finished so there
+    // is nothing more to send. Benign only if the downstream half signaled
+    // completion; otherwise the closure is unexpected, so surface it.
+    if tx.is_closed() {
+        if PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire)) {
             return Ok(());
+        }
+        return Error::e_explain(
+            InternalError,
+            "h2 task pipe closed unexpectedly before trailers",
+        );
+    }
+
+    // attempt to get trailers, racing against channel close
+    let trailers = tokio::select! {
+        biased;
+        t = client.read_trailers() => {
+            match t {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.send(HttpTask::Failed(e.into_up())).await;
+                    return Ok(());
+                }
+            }
+        }
+        _ = tx.closed() => {
+            // Benign only if the downstream half signaled completion; otherwise
+            // the closure is unexpected, so surface it.
+            if PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire)) {
+                return Ok(());
+            }
+            return Error::e_explain(InternalError, "h2 task pipe closed unexpectedly while reading trailers");
         }
     };
 
     let trailers = trailers.map(Box::new);
 
     if trailers.is_some() {
-        tx.send(HttpTask::Trailer(trailers))
-            .await
-            .or_err(InternalError, "sending h2 trailer to pipe")?;
+        // Benign only if the downstream signaled completion, same as the body sends above.
+        let send_result = tx.send(HttpTask::Trailer(trailers)).await;
+        if send_result.is_err()
+            && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+        {
+            return Ok(());
+        }
+        send_result.or_err(InternalError, "sending h2 trailer to pipe")?;
     }
 
-    tx.send(HttpTask::Done)
-        .await
-        .unwrap_or_else(|_| debug!("h2 to h1 channel closed!"));
+    let send_result = tx.send(HttpTask::Done).await;
+    if send_result.is_err() && PipeState::is_downstream_complete(pipe_state.load(Ordering::Acquire))
+    {
+        debug!("h2 to h1 channel closed!");
+        return Ok(());
+    }
+    send_result.or_err(InternalError, "sending h2 done to pipe")?;
 
     Ok(())
 }
 
 #[test]
-fn test_update_authority() {
-    let mut parts = http::request::Builder::new()
+fn test_update_h2_scheme_authority() {
+    fn update(header: &mut RequestHeader, raw_host: &[u8], tls: bool) -> Result<()> {
+        let path_and_query = h2_path_and_query(header)?;
+        update_h2_scheme_authority(header, raw_host, tls, path_and_query)
+    }
+
+    let parts = http::request::Builder::new()
         .body(())
         .unwrap()
         .into_parts()
         .0;
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("example.com", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:456", true).unwrap();
-    assert_eq!("example.com:456", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:", true).unwrap();
-    assert_eq!("example.com:", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"example.com:123:345", true).unwrap();
-    assert_eq!("example.com:123", parts.uri.authority().unwrap());
-    update_h2_scheme_authority(&mut parts, b"[::1]", true).unwrap();
-    assert_eq!("[::1]", parts.uri.authority().unwrap());
+    let mut header = RequestHeader::from(parts);
+    update(&mut header, b"example.com", true).unwrap();
+    assert_eq!("example.com", header.uri.authority().unwrap());
+    let err = update(&mut header, b"user@example.com", true).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    update(&mut header, b"example.com:456", true).unwrap();
+    assert_eq!("example.com:456", header.uri.authority().unwrap());
+    update(&mut header, b"example.com:", true).unwrap();
+    assert_eq!("example.com:", header.uri.authority().unwrap());
+    let err = update(&mut header, b"example.com:123:345", true).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    update(&mut header, b"[::1]", true).unwrap();
+    assert_eq!("[::1]", header.uri.authority().unwrap());
 
     // verify scheme
-    update_h2_scheme_authority(&mut parts, b"example.com", true).unwrap();
-    assert_eq!("https://example.com", parts.uri);
-    update_h2_scheme_authority(&mut parts, b"example.com", false).unwrap();
-    assert_eq!("http://example.com", parts.uri);
+    update(&mut header, b"example.com", true).unwrap();
+    assert_eq!("https://example.com", header.uri);
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!("http://example.com", header.uri);
+
+    // H1 absolute-form is decomposed into H2 pseudo-header components.
+    let mut header = RequestHeader::build("GET", b"http://example.com/path?q=1", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/path?q=1");
+
+    let mut header = RequestHeader::build(
+        "GET",
+        b"http://example.com/caf%C3%A9?q=r%C3%A9sum%C3%A9",
+        None,
+    )
+    .unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(
+        header.uri.path_and_query().unwrap().as_str(),
+        "/caf%C3%A9?q=r%C3%A9sum%C3%A9"
+    );
+
+    let mut header = RequestHeader::build("GET", b"http://example.com?only=query", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(
+        header.uri.path_and_query().unwrap().as_str(),
+        "/?only=query"
+    );
+
+    let mut header = RequestHeader::build("GET", b"http://example.com", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/");
+
+    // Origin-form remains unchanged.
+    let mut header = RequestHeader::build("GET", b"/path?q=1", None).unwrap();
+    update(&mut header, b"example.com", false).unwrap();
+    assert_eq!(header.uri.path_and_query().unwrap().as_str(), "/path?q=1");
+
+    let mut header = RequestHeader::build("GET", b"http:/\\/\\other.example/admin", None).unwrap();
+    let err = update(&mut header, b"example.com", false).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    assert_eq!(
+        err.context.as_ref().map(|context| context.as_str()),
+        Some("ambiguous HTTP absolute-form request target")
+    );
+
+    let raw_target = b"http://example.com/\xff";
+    let mut header = RequestHeader::build("GET", raw_target, None).unwrap();
+    let err = update(&mut header, b"example.com", false).unwrap_err();
+    assert_eq!(err.etype(), &InvalidHTTPHeader);
+    assert_eq!(
+        err.context.as_ref().map(|context| context.as_str()),
+        Some("non-UTF-8 request target cannot be forwarded over HTTP/2")
+    );
+    assert_eq!(header.raw_path(), raw_target);
+}
+
+#[test]
+fn test_h2_path_is_rooted_for_targets_with_no_authority() {
+    // Targets with no absolute-form authority carry no absolute path, so :path is rooted
+    // rather than forwarding bytes that are invalid there (RFC 9113 section 8.3.1).
+    // Forwarding them would also concatenate against the authority, rendering as
+    // "http://example.comfoo/bar".
+    for target in [&b"foo/bar"[..], b"myproto:opaque", b"foo?q=1"] {
+        let mut header = RequestHeader::build("GET", target, None).unwrap();
+        let label = String::from_utf8_lossy(target);
+        // The H1 wire serializes these bytes; only the H2 rewrite below discards them.
+        assert_eq!(target, header.raw_path(), "{label}");
+
+        let path_and_query = h2_path_and_query(&header).unwrap();
+        assert_eq!("/", path_and_query.as_str(), "{label}");
+
+        update_h2_scheme_authority(&mut header, b"example.com", false, path_and_query).unwrap();
+        assert_eq!("http://example.com/", header.uri.to_string(), "{label}");
+        assert_eq!(
+            Some("example.com"),
+            header.uri.authority().map(|authority| authority.as_str()),
+            "{label}"
+        );
+    }
 }

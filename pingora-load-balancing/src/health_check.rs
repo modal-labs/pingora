@@ -46,6 +46,9 @@ pub trait HealthCheck {
     /// Check the given backend.
     ///
     /// `Ok(())`` if the check passes, otherwise the check fails.
+    ///
+    /// A health-check pass drops this future to cancel the check on shutdown,
+    /// so an implementation must not rely on running to completion once polled.
     async fn check(&self, target: &Backend) -> Result<()>;
 
     /// Called when the health changes for a [Backend].
@@ -289,15 +292,16 @@ where
         let session = self.connector.get_http_session(&peer).await?;
 
         let mut session = session.0;
+
+        session.set_write_timeout(peer.options.write_timeout);
+
         let req = Box::new(self.req.clone());
         session.write_request_header(req).await?;
         session.finish_request_body().await?;
 
         custom_session!(session.finish_custom().await?);
 
-        if let Some(read_timeout) = peer.options.read_timeout {
-            session.set_read_timeout(Some(read_timeout));
-        }
+        session.set_read_timeout(peer.options.read_timeout);
 
         session.read_response_header().await?;
 
@@ -346,48 +350,31 @@ where
 struct HealthInner {
     /// Whether the endpoint is healthy to serve traffic
     healthy: bool,
-    /// Whether the endpoint is allowed to serve traffic independent of its health
-    enabled: bool,
     /// The counter for stateful transition between healthy and unhealthy.
     /// When [healthy] is true, this counts the number of consecutive health check failures
     /// so that the caller can flip the healthy when a certain threshold is met, and vise versa.
     consecutive_counter: usize,
 }
 
-/// Health of backends that can be updated atomically
-pub(crate) struct Health(ArcSwap<HealthInner>);
+/// Health of backends that can be updated atomically.
+///
+/// Clones share the same state so registry reconciliation cannot lose a health
+/// observation that completes concurrently.
+#[derive(Clone)]
+pub(crate) struct Health(Arc<ArcSwap<HealthInner>>);
 
 impl Default for Health {
     fn default() -> Self {
-        Health(ArcSwap::new(Arc::new(HealthInner {
+        Health(Arc::new(ArcSwap::new(Arc::new(HealthInner {
             healthy: true, // TODO: allow to start with unhealthy
-            enabled: true,
             consecutive_counter: 0,
-        })))
-    }
-}
-
-impl Clone for Health {
-    fn clone(&self) -> Self {
-        let inner = self.0.load_full();
-        Health(ArcSwap::new(inner))
+        }))))
     }
 }
 
 impl Health {
     pub fn ready(&self) -> bool {
-        let h = self.0.load();
-        h.healthy && h.enabled
-    }
-
-    pub fn enable(&self, enabled: bool) {
-        let h = self.0.load();
-        if h.enabled != enabled {
-            // clone the inner
-            let mut new_health = (**h).clone();
-            new_health.enabled = enabled;
-            self.0.store(Arc::new(new_health));
-        };
+        self.0.load().healthy
     }
 
     // return true when the health is flipped
