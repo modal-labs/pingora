@@ -508,8 +508,8 @@ impl Connector {
 // limiting how much data can be inflight. However, setting this value will also cap the max
 // download speed by limiting the bandwidth-delay product of a link.
 // Long term, we should advertising large window but shrink it when a small buffer is full.
-// 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
-const H2_WINDOW_SIZE: u32 = 1 << 23;
+// 1 Mbyte = 10 Mbytes/s X 100ms or 100 Mbytes/s X 10ms.
+const H2_WINDOW_SIZE: u32 = 1 << 20;
 
 pub async fn handshake(
     stream: Stream,
