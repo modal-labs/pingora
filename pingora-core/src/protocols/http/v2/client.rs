@@ -401,9 +401,9 @@ impl Http2Session {
         self.conn.clone()
     }
 
-    /// Whether ping timeout occurred. After a ping timeout, the h2 connection will be terminated.
-    /// Ongoing h2 streams will receive an stream/connection error. The streams should check this
-    /// flag to tell whether the error is triggered by the timeout.
+    /// Whether ping timeout occurred. After a ping timeout, the h2 connection will be terminated,
+    /// or with `quarantine_on_ping_timeout` it admits no new streams and closes once its in-flight
+    /// streams are released.
     pub(crate) fn ping_timedout(&self) -> bool {
         self.conn.ping_timedout()
     }
@@ -541,12 +541,15 @@ pub async fn drive_connection<S>(
     closed: watch::Sender<bool>,
     ping_interval: Option<Duration>,
     ping_timeout_occurred: Arc<AtomicBool>,
+    // If not none, the option should contain the connection's `shutting_down` flag, which
+    // will be set on a ping timeout to quarantine the connection. If None, the connection will be closed.
+    quarantine_flag: Option<Arc<AtomicBool>>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
     let interval = ping_interval.unwrap_or(Duration::ZERO);
     if !interval.is_zero() {
-        // for ping to inform this fn to drop the connection
+        // for ping to inform this fn to drop or quarantine the connection
         let (tx, rx) = oneshot::channel::<()>();
         // for this fn to inform ping to give up when it is already dropped
         let dropped = Arc::new(AtomicBool::new(false));
@@ -561,16 +564,26 @@ pub async fn drive_connection<S>(
         }
 
         tokio::select! {
-            r = c => match r {
+            r = &mut c => match r {
                 Ok(_) => debug!("H2 connection finished fd: {id}"),
                 Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
             },
-            r = rx => match r {
-                Ok(_) => {
+            r = rx => match (r, quarantine_flag) {
+                // Quarantine rather than close
+                (Ok(_), Some(shutting_down)) => {
+                    ping_timeout_occurred.store(true, Ordering::Relaxed);
+                    shutting_down.store(true, Ordering::Relaxed);
+                    warn!("H2 connection Ping timeout/Error fd: {id}, connection will be quarantined");
+                    match c.await {
+                        Ok(_) => debug!("H2 connection finished fd: {id}"),
+                        Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
+                    }
+                }
+                (Ok(_), None) => {
                     ping_timeout_occurred.store(true, Ordering::Relaxed);
                     warn!("H2 connection Ping timeout/Error fd: {id}, closing conn");
                 },
-                Err(e) => warn!("H2 connection Ping Rx error {e:?}"),
+                (Err(e), _) => warn!("H2 connection Ping Rx error {e:?}"),
             },
         };
 

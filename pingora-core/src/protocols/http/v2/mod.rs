@@ -111,7 +111,7 @@ mod test {
 
         // Client
         handles.push(tokio::spawn(async move {
-            let conn = crate::connectors::http::v2::handshake(Box::new(client), 500, None)
+            let conn = crate::connectors::http::v2::handshake(Box::new(client), 500, None, false)
                 .await
                 .unwrap();
 
