@@ -79,7 +79,7 @@ pub(crate) struct ConnectionRefInner {
     // how many concurrent streams already active
     current_streams: AtomicUsize,
     // The connection is gracefully shutting down, no more stream is allowed
-    shutting_down: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
     // because `SendRequest` doesn't actually have access to the underlying Stream,
     // we log info about timing and tcp info here.
     pub(crate) digest: Digest,
@@ -106,7 +106,7 @@ impl ConnectionRef {
             id,
             max_streams,
             current_streams: AtomicUsize::new(0),
-            shutting_down: false.into(),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             digest,
             release_lock: Arc::new(Mutex::new(())),
         }))
@@ -371,7 +371,13 @@ impl Connector {
             }
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+        let conn = handshake(
+            stream,
+            max_h2_stream,
+            peer.h2_ping_interval(),
+            peer.quarantine_on_ping_timeout(),
+        )
+        .await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -408,9 +414,11 @@ impl Connector {
             .in_use_pool
             .get(reuse_hash)
             // filter out closed, InUsePool does not have notify closed eviction like the idle pool
-            // and it's possible we get an in use connection that is closed and not yet released
-            .filter(|c| !c.is_closed())
-            .or_else(|| self.idle_pool.get(&reuse_hash));
+            // and it's possible we get an in use connection that is closed and not yet released.
+            // Also filter out connections quarantined by a ping timeout
+            .filter(|c| !c.is_closed() && !c.is_shutting_down())
+            .or_else(|| self.idle_pool.get(&reuse_hash))
+            .filter(|c| !c.is_shutting_down());
         if let Some(conn) = maybe_conn {
             #[cfg(unix)]
             if !peer.matches_fd(conn.id()) {
@@ -515,6 +523,7 @@ pub async fn handshake(
     stream: Stream,
     max_streams: usize,
     h2_ping_interval: Option<Duration>,
+    quarantine_on_ping_timeout: bool,
 ) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
@@ -560,6 +569,15 @@ pub async fn handshake(
 
     let (closed_tx, closed_rx) = watch::channel(false);
 
+    let conn = ConnectionRef::new(
+        send_req,
+        closed_rx,
+        ping_timeout_occurred,
+        id,
+        max_allowed_streams,
+        digest,
+    );
+    let shutting_down = conn.0.shutting_down.clone();
     current_handle().spawn(async move {
         drive_connection(
             connection,
@@ -567,17 +585,11 @@ pub async fn handshake(
             closed_tx,
             h2_ping_interval,
             ping_timeout_clone,
+            quarantine_on_ping_timeout.then_some(shutting_down),
         )
         .await;
     });
-    Ok(ConnectionRef::new(
-        send_req,
-        closed_rx,
-        ping_timeout_occurred,
-        id,
-        max_allowed_streams,
-        digest,
-    ))
+    Ok(conn)
 }
 
 // TODO(slava): add custom unit tests
@@ -692,6 +704,84 @@ mod tests {
         // live stream.
         let reused = connector.reused_http_session(&peer).await.unwrap();
         assert!(reused.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_h2_ping_timeout_quarantines_connection() {
+        use http::{Response, StatusCode};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        // An h2c server that accepts one stream and then stops polling its
+        // connection, so the stream stalls and pings go unacked, until the
+        // test resumes it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(socket).await.unwrap();
+            let (_req, respond) = conn.accept().await.unwrap().unwrap();
+            let _ = stalled_tx.send((conn, respond));
+        });
+
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(addr, false, "".into());
+        peer.options.set_http_version(2, 2);
+        peer.options.max_h2_streams = 100;
+        peer.options.h2_ping_interval = Some(Duration::from_millis(100));
+        peer.options.quarantine_on_ping_timeout = true;
+
+        let mut h2_1 = match connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap()
+        {
+            HttpSession::H2(h2_stream) => h2_stream,
+            _ => panic!("expect h2"),
+        };
+        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2_1.write_request_header(Box::new(req), true).unwrap();
+        let (mut server_conn, respond) = stalled_rx.await.unwrap();
+
+        let conn = h2_1.conn();
+        let mut closed = conn.0.closed.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !conn.is_shutting_down() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("ping timeout did not quarantine the connection");
+        assert!(conn.ping_timedout());
+
+        // Quarantined: still open for the in-flight stream, but new streams
+        // must go to a new connection.
+        assert!(!conn.is_closed());
+        assert!(!conn.more_streams_allowed());
+        drop(conn);
+        assert!(connector
+            .reused_http_session(&peer)
+            .await
+            .unwrap()
+            .is_none());
+
+        // The server recovers: the in-flight stream completes normally.
+        let mut respond = respond;
+        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+        respond.send_response(resp, true).unwrap();
+        tokio::spawn(async move { while server_conn.accept().await.is_some() {} });
+        h2_1.read_response_header().await.unwrap();
+        assert_eq!(h2_1.response_header().unwrap().status, StatusCode::OK);
+
+        // Releasing the last stream does not pool the connection; it closes.
+        connector.release_http_session(h2_1, &peer, None);
+        tokio::time::timeout(Duration::from_secs(5), closed.wait_for(|c| *c))
+            .await
+            .expect("quarantined connection did not close after its last stream")
+            .unwrap();
     }
 
     #[tokio::test]
