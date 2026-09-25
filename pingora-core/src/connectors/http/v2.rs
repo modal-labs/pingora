@@ -371,7 +371,13 @@ impl Connector {
             }
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+        let conn = handshake(
+            stream,
+            max_h2_stream,
+            peer.h2_ping_interval(),
+            peer.log_on_ping_timeout(),
+        )
+        .await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -515,6 +521,7 @@ pub async fn handshake(
     stream: Stream,
     max_streams: usize,
     h2_ping_interval: Option<Duration>,
+    log_on_ping_timeout: bool,
 ) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
@@ -567,6 +574,7 @@ pub async fn handshake(
             closed_tx,
             h2_ping_interval,
             ping_timeout_clone,
+            log_on_ping_timeout,
         )
         .await;
     });
@@ -692,6 +700,56 @@ mod tests {
         // live stream.
         let reused = connector.reused_http_session(&peer).await.unwrap();
         assert!(reused.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_h2_log_on_ping_timeout_keeps_connection_open() {
+        use http::{Response, StatusCode};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        // An h2c server that accepts one stream and then stops polling its
+        // connection, so pings go unacked, until the test resumes it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(socket).await.unwrap();
+            let (_req, respond) = conn.accept().await.unwrap().unwrap();
+            let _ = stalled_tx.send((conn, respond));
+        });
+
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(addr, false, "".into());
+        peer.options.set_http_version(2, 2);
+        peer.options.h2_ping_interval = Some(Duration::from_millis(100));
+        peer.options.log_on_ping_timeout = true;
+
+        let mut h2 = match connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap()
+        {
+            HttpSession::H2(h2_stream) => h2_stream,
+            _ => panic!("expect h2"),
+        };
+        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2.write_request_header(Box::new(req), true).unwrap();
+        let (mut server_conn, mut respond) = stalled_rx.await.unwrap();
+
+        // Past the 5s ping timeout, the connection is still open and usable.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!h2.conn().is_closed());
+        assert!(!h2.ping_timedout());
+
+        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+        respond.send_response(resp, true).unwrap();
+        tokio::spawn(async move { while server_conn.accept().await.is_some() {} });
+        h2.read_response_header().await.unwrap();
+        assert_eq!(h2.response_header().unwrap().status, StatusCode::OK);
     }
 
     #[tokio::test]
