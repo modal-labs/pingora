@@ -371,13 +371,7 @@ impl Connector {
             }
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(
-            stream,
-            max_h2_stream,
-            peer.h2_ping_interval(),
-            peer.log_on_ping_timeout(),
-        )
-        .await?;
+        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -521,7 +515,6 @@ pub async fn handshake(
     stream: Stream,
     max_streams: usize,
     h2_ping_interval: Option<Duration>,
-    log_on_ping_timeout: bool,
 ) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
@@ -555,8 +548,8 @@ pub async fn handshake(
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
     debug!("H2 handshake to server done.");
+    // Ping timeouts are observe-only (see drive_connection), so this never flips.
     let ping_timeout_occurred = Arc::new(AtomicBool::new(false));
-    let ping_timeout_clone = ping_timeout_occurred.clone();
     let max_allowed_streams = std::cmp::min(max_streams, connection.max_concurrent_send_streams());
 
     // Safe guard: new_http_session() assumes there should be at least one free stream
@@ -568,15 +561,7 @@ pub async fn handshake(
     let (closed_tx, closed_rx) = watch::channel(false);
 
     current_handle().spawn(async move {
-        drive_connection(
-            connection,
-            id,
-            closed_tx,
-            h2_ping_interval,
-            ping_timeout_clone,
-            log_on_ping_timeout,
-        )
-        .await;
+        drive_connection(connection, id, closed_tx, h2_ping_interval).await;
     });
     Ok(ConnectionRef::new(
         send_req,
@@ -703,7 +688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_h2_log_on_ping_timeout_keeps_connection_open() {
+    async fn test_h2_ping_timeout_keeps_connection_open() {
         use http::{Response, StatusCode};
         use tokio::net::TcpListener;
         use tokio::sync::oneshot;
@@ -724,7 +709,6 @@ mod tests {
         let mut peer = HttpPeer::new(addr, false, "".into());
         peer.options.set_http_version(2, 2);
         peer.options.h2_ping_interval = Some(Duration::from_millis(100));
-        peer.options.log_on_ping_timeout = true;
 
         let mut h2 = match connector
             .new_http_session::<HttpPeer, ()>(&peer)

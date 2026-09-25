@@ -237,13 +237,6 @@ pub trait Peer: Display + Clone {
         self.get_peer_options().and_then(|o| o.h2_ping_interval)
     }
 
-    /// Whether an h2 ping timeout is only logged instead of closing the connection.
-    /// See [PeerOptions::log_on_ping_timeout].
-    fn log_on_ping_timeout(&self) -> bool {
-        self.get_peer_options()
-            .is_some_and(|o| o.log_on_ping_timeout)
-    }
-
     /// The size of the TCP receive buffer should be limited to. See SO_RCVBUF for more details.
     fn tcp_recv_buf(&self) -> Option<usize> {
         self.get_peer_options().and_then(|o| o.tcp_recv_buf)
@@ -432,8 +425,6 @@ pub struct PeerOptions {
     pub tcp_recv_buf: Option<usize>,
     pub dscp: Option<u8>,
     pub h2_ping_interval: Option<Duration>,
-    /// On an h2 ping timeout, log but don't close the connection.
-    pub log_on_ping_timeout: bool,
     #[cfg(feature = "s2n")]
     pub psk: Option<Arc<PskType>>,
     #[cfg(feature = "s2n")]
@@ -496,7 +487,6 @@ impl PeerOptions {
             tcp_recv_buf: None,
             dscp: None,
             h2_ping_interval: None,
-            log_on_ping_timeout: false,
             #[cfg(feature = "s2n")]
             psk: None,
             #[cfg(feature = "s2n")]
@@ -578,9 +568,6 @@ impl Display for PeerOptions {
         }
         if let Some(h2_ping_interval) = self.h2_ping_interval {
             write!(f, "h2_ping_interval: {:?},", h2_ping_interval)?;
-        }
-        if self.log_on_ping_timeout {
-            write!(f, "log_on_ping_timeout: true,")?;
         }
         Ok(())
     }

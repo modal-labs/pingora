@@ -540,8 +540,6 @@ pub async fn drive_connection<S>(
     id: UniqueIDType,
     closed: watch::Sender<bool>,
     ping_interval: Option<Duration>,
-    ping_timeout_occurred: Arc<AtomicBool>,
-    log_on_ping_timeout: bool,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
@@ -566,21 +564,17 @@ pub async fn drive_connection<S>(
                 Ok(_) => debug!("H2 connection finished fd: {id}"),
                 Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
             },
-            r = rx => match r {
-                // Observe-only: record that the ping check would have closed
-                // the connection, and keep serving its streams.
-                Ok(_) if log_on_ping_timeout => {
-                    warn!("H2 connection Ping timeout/Error fd: {id}, would have closed conn");
-                    match c.await {
-                        Ok(_) => debug!("H2 connection finished fd: {id}"),
-                        Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
-                    }
+            r = rx => {
+                // Observe-only: a ping timeout is logged, but the connection
+                // keeps serving its streams.
+                match r {
+                    Ok(_) => warn!("H2 connection Ping timeout/Error fd: {id}, would have closed conn"),
+                    Err(e) => warn!("H2 connection Ping Rx error {e:?}"),
                 }
-                Ok(_) => {
-                    ping_timeout_occurred.store(true, Ordering::Relaxed);
-                    warn!("H2 connection Ping timeout/Error fd: {id}, closing conn");
-                },
-                Err(e) => warn!("H2 connection Ping Rx error {e:?}"),
+                match c.await {
+                    Ok(_) => debug!("H2 connection finished fd: {id}"),
+                    Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
+                }
             },
         };
 
