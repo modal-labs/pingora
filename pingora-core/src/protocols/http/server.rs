@@ -475,8 +475,8 @@ impl Session {
 
     /// Serialize the request header into HTTP/1.x wire format.
     ///
-    /// This serializes the parsed request header including any mutations 
-    /// made by filters, rather than the raw bytes as read from the wire. 
+    /// This serializes the parsed request header including any mutations
+    /// made by filters, rather than the raw bytes as read from the wire.
     /// Whitespace is normalized.
     pub fn to_h1_raw(&self) -> Bytes {
         match self {

@@ -540,7 +540,6 @@ pub async fn drive_connection<S>(
     id: UniqueIDType,
     closed: watch::Sender<bool>,
     ping_interval: Option<Duration>,
-    ping_timeout_occurred: Arc<AtomicBool>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
@@ -561,16 +560,21 @@ pub async fn drive_connection<S>(
         }
 
         tokio::select! {
-            r = c => match r {
+            r = &mut c => match r {
                 Ok(_) => debug!("H2 connection finished fd: {id}"),
                 Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
             },
-            r = rx => match r {
-                Ok(_) => {
-                    ping_timeout_occurred.store(true, Ordering::Relaxed);
-                    warn!("H2 connection Ping timeout/Error fd: {id}, closing conn");
-                },
-                Err(e) => warn!("H2 connection Ping Rx error {e:?}"),
+            r = rx => {
+                // Observe-only: a ping timeout is logged, but the connection
+                // keeps serving its streams.
+                match r {
+                    Ok(_) => warn!("H2 connection Ping timeout/Error fd: {id}, would have closed conn"),
+                    Err(e) => warn!("H2 connection Ping Rx error {e:?}"),
+                }
+                match c.await {
+                    Ok(_) => debug!("H2 connection finished fd: {id}"),
+                    Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
+                }
             },
         };
 
