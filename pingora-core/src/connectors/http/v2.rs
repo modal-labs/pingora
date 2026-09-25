@@ -504,12 +504,15 @@ impl Connector {
 }
 
 // The h2 library we use has unbounded internal buffering, which will cause excessive memory
-// consumption when the downstream is slower than upstream. This window size caps the buffering by
-// limiting how much data can be inflight. However, setting this value will also cap the max
-// download speed by limiting the bandwidth-delay product of a link.
+// consumption when the downstream is slower than upstream. These window sizes cap the buffering by
+// limiting how much data can be inflight. However, they also cap the max download speed by
+// limiting the bandwidth-delay product of a link.
 // Long term, we should advertising large window but shrink it when a small buffer is full.
-// 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
-const H2_WINDOW_SIZE: u32 = 1 << 23;
+// The stream window caps buffering and throughput per response:
+// 1 Mbyte = 10 Mbytes/s X 100ms or 100 Mbytes/s X 10ms.
+// The connection window caps the total across all streams on the connection.
+const H2_CONNECTION_WINDOW_SIZE: u32 = 1 << 23;
+const H2_STREAM_WINDOW_SIZE: u32 = 1 << 20;
 
 pub async fn handshake(
     stream: Stream,
@@ -541,9 +544,9 @@ pub async fn handshake(
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
-        .initial_window_size(H2_WINDOW_SIZE)
-        // should this be max_streams * H2_WINDOW_SIZE?
-        .initial_connection_window_size(H2_WINDOW_SIZE)
+        .initial_window_size(H2_STREAM_WINDOW_SIZE)
+        // should this be max_streams * H2_STREAM_WINDOW_SIZE?
+        .initial_connection_window_size(H2_CONNECTION_WINDOW_SIZE)
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
