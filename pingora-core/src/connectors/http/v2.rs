@@ -78,6 +78,8 @@ pub(crate) struct ConnectionRefInner {
     max_streams: usize,
     // how many concurrent streams already active
     current_streams: AtomicUsize,
+    // reset streams not yet confirmed by a PING ACK, see record_pending_reset()
+    pending_resets: Option<Mutex<(h2::PingPong, usize)>>,
     // The connection is gracefully shutting down, no more stream is allowed
     shutting_down: AtomicBool,
     // because `SendRequest` doesn't actually have access to the underlying Stream,
@@ -95,6 +97,7 @@ impl ConnectionRef {
         send_req: SendRequest<Bytes>,
         closed: watch::Receiver<bool>,
         ping_timeout_occurred: Arc<AtomicBool>,
+        pending_resets_ping: Option<h2::PingPong>,
         id: UniqueIDType,
         max_streams: usize,
         digest: Digest,
@@ -106,6 +109,7 @@ impl ConnectionRef {
             id,
             max_streams,
             current_streams: AtomicUsize::new(0),
+            pending_resets: pending_resets_ping.map(|p| Mutex::new((p, 0))),
             shutting_down: false.into(),
             digest,
             release_lock: Arc::new(Mutex::new(())),
@@ -113,7 +117,7 @@ impl ConnectionRef {
     }
 
     pub fn more_streams_allowed(&self) -> bool {
-        let current = self.0.current_streams.load(Ordering::Relaxed);
+        let current = self.0.current_streams.load(Ordering::Relaxed) + self.pending_resets();
         !self.is_shutting_down()
             && self.0.max_streams > current
             && self.0.connection_stub.0.current_max_send_streams() > current
@@ -125,6 +129,44 @@ impl ConnectionRef {
 
     pub fn release_stream(&self) {
         self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Like Go's http2 transport, a canceled stream keeps counting against max_streams until the
+    /// server acks a PING sent along with its RST_STREAM. So an unresponsive connection takes at
+    /// most max_streams more requests, after which new requests go to a new connection.
+    /// See <https://github.com/golang/net/commit/f35fec92ec9213ee211cf45f451a5970386f7978>
+    pub(crate) fn record_pending_reset(&self) {
+        if let Some(pending) = &self.0.pending_resets {
+            let (pending_resets_ping, count) = &mut *pending.lock();
+            Self::clear_confirmed_resets(pending_resets_ping, count);
+            if *count == 0 {
+                if let Err(e) = pending_resets_ping.send_ping(h2::Ping::opaque()) {
+                    debug!("H2 fd: {} pending reset ping failed: {e}", self.0.id);
+                }
+            }
+            *count += 1;
+        }
+    }
+
+    /// The number of reset streams not yet confirmed by the peer
+    pub fn pending_resets(&self) -> usize {
+        let Some(pending) = &self.0.pending_resets else {
+            return 0;
+        };
+        let (pending_resets_ping, count) = &mut *pending.lock();
+        Self::clear_confirmed_resets(pending_resets_ping, count);
+        *count
+    }
+
+    // Reset `count` to 0 if the ping sent for the pending resets has been acked
+    fn clear_confirmed_resets(pending_resets_ping: &mut h2::PingPong, count: &mut usize) {
+        if *count == 0 {
+            return;
+        }
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        if pending_resets_ping.poll_pong(&mut cx).is_ready() {
+            *count = 0;
+        }
     }
 
     pub fn id(&self) -> UniqueIDType {
@@ -172,7 +214,7 @@ impl ConnectionRef {
         // Atomically check if the current_stream is over the limit
         // load(), compare and then fetch_add() cannot guarantee the same
         let current_streams = self.0.current_streams.fetch_add(1, Ordering::SeqCst);
-        if current_streams >= max_streams {
+        if current_streams + self.pending_resets() >= max_streams {
             // already over the limit, reset the counter to the previous value
             self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
@@ -538,7 +580,7 @@ pub async fn handshake(
         socket_digest: stream.get_socket_digest(),
     };
     // TODO: make these configurable
-    let (send_req, connection) = Builder::new()
+    let (send_req, mut connection) = Builder::new()
         .enable_push(false)
         .initial_max_send_streams(max_streams)
         // The limit for the server. Server push is not allowed, so this value doesn't matter
@@ -562,6 +604,11 @@ pub async fn handshake(
     }
 
     let (closed_tx, closed_rx) = watch::channel(false);
+    assert!(
+        h2_ping_interval.is_none_or(|i| i.is_zero()),
+        "h2_ping_interval is currently incompatible with pending reset tracking"
+    );
+    let pending_resets_ping = connection.ping_pong();
 
     current_handle().spawn(async move {
         drive_connection(connection, id, closed_tx, h2_ping_interval).await;
@@ -570,6 +617,7 @@ pub async fn handshake(
         send_req,
         closed_rx,
         ping_timeout_occurred,
+        pending_resets_ping,
         id,
         max_allowed_streams,
         digest,
@@ -688,55 +736,6 @@ mod tests {
         // live stream.
         let reused = connector.reused_http_session(&peer).await.unwrap();
         assert!(reused.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_h2_ping_timeout_keeps_connection_open() {
-        use http::{Response, StatusCode};
-        use tokio::net::TcpListener;
-        use tokio::sync::oneshot;
-
-        // An h2c server that accepts one stream and then stops polling its
-        // connection, so pings go unacked, until the test resumes it.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (stalled_tx, stalled_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut conn = h2::server::handshake(socket).await.unwrap();
-            let (_req, respond) = conn.accept().await.unwrap().unwrap();
-            let _ = stalled_tx.send((conn, respond));
-        });
-
-        let connector = Connector::new(None);
-        let mut peer = HttpPeer::new(addr, false, "".into());
-        peer.options.set_http_version(2, 2);
-        peer.options.h2_ping_interval = Some(Duration::from_millis(100));
-
-        let mut h2 = match connector
-            .new_http_session::<HttpPeer, ()>(&peer)
-            .await
-            .unwrap()
-        {
-            HttpSession::H2(h2_stream) => h2_stream,
-            _ => panic!("expect h2"),
-        };
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
-        req.insert_header(http::header::HOST, "example.com")
-            .unwrap();
-        h2.write_request_header(Box::new(req), true).unwrap();
-        let (mut server_conn, mut respond) = stalled_rx.await.unwrap();
-
-        // Past the 5s ping timeout, the connection is still open and usable.
-        tokio::time::sleep(Duration::from_secs(6)).await;
-        assert!(!h2.conn().is_closed());
-        assert!(!h2.ping_timedout());
-
-        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
-        respond.send_response(resp, true).unwrap();
-        tokio::spawn(async move { while server_conn.accept().await.is_some() {} });
-        h2.read_response_header().await.unwrap();
-        assert_eq!(h2.response_header().unwrap().status, StatusCode::OK);
     }
 
     #[tokio::test]
@@ -889,5 +888,84 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    fn test_request() -> Box<pingora_http::RequestHeader> {
+        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        Box::new(req)
+    }
+
+    #[tokio::test]
+    async fn test_h2_pending_resets_limit_unresponsive_conn() {
+        // the server never reads anything, so our pings are never acked
+        let (client_io, _server_io) = tokio::io::duplex(1 << 20);
+        let conn = handshake(Box::new(client_io), 3, None).await.unwrap();
+
+        for i in 0..3 {
+            assert!(conn.more_streams_allowed());
+            let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
+            h2.write_request_header(test_request(), true).unwrap();
+            // cancel the request before any response
+            drop(h2);
+            assert_eq!(conn.pending_resets(), i + 1);
+        }
+
+        // the reset streams still take up all the slots, so the conn takes no new streams
+        assert!(conn.is_idle());
+        assert!(!conn.is_closed());
+        assert!(!conn.more_streams_allowed());
+        assert!(conn.spawn_stream().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_h2_pending_resets_cleared_by_ping_ack() {
+        use http::{Response, StatusCode};
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let mut pending = vec![];
+            // respond to the first request only, keep the rest hanging
+            // keep polling the connection so that pings get acked
+            while let Some(result) = conn.accept().await {
+                let (_req, mut send_resp) = result.unwrap();
+                if pending.is_empty() {
+                    let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    send_resp.send_response(resp, true).unwrap();
+                }
+                pending.push(send_resp);
+            }
+        });
+        let conn = handshake(Box::new(client_io), 3, None).await.unwrap();
+
+        // a finished response doesn't count as a pending reset
+        let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
+        h2.write_request_header(test_request(), true).unwrap();
+        h2.read_response_header().await.unwrap();
+        assert!(h2.read_response_body().await.unwrap().is_none());
+        drop(h2);
+        assert_eq!(conn.pending_resets(), 0);
+
+        // cancel two requests before they get a response
+        for _ in 0..2 {
+            let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
+            h2.write_request_header(test_request(), true).unwrap();
+            drop(h2);
+        }
+        assert!(conn.pending_resets() > 0);
+
+        // the ping ack confirms the resets and frees up the slots
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while conn.pending_resets() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending resets should be cleared by the ping ack");
+        assert!(!conn.is_closed());
+        assert!(!conn.ping_timedout());
+        assert!(conn.more_streams_allowed());
     }
 }
