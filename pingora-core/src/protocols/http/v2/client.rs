@@ -20,7 +20,7 @@ use futures::FutureExt;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
 use http::HeaderMap;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use pingora_error::{Error, ErrorType, ErrorType::*, OrErr, Result, RetryType};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
@@ -61,6 +61,10 @@ pub struct Http2Session {
 
 impl Drop for Http2Session {
     fn drop(&mut self) {
+        // h2 sends RST_STREAM when dropping a stream whose response hasn't finished
+        if self.req_sent.is_some() && !self.response_finished() {
+            self.conn.record_pending_reset();
+        }
         self.conn.release_stream();
     }
 }
@@ -603,7 +607,7 @@ async fn do_ping_pong(
         debug!("H2 fd: {id} ping sent");
         match tokio::time::timeout(PING_TIMEOUT, ping_fut).await {
             Err(_) => {
-                error!("H2 fd: {id} ping timeout");
+                warn!("H2 fd: {id} ping timeout");
                 let _ = tx.send(());
                 break;
             }
@@ -617,7 +621,7 @@ async fn do_ping_pong(
                         // drive_connection() exits first, no need to error again
                         break;
                     }
-                    error!("H2 fd: {id} ping error: {e}");
+                    warn!("H2 fd: {id} ping error: {e}");
                     let _ = tx.send(());
                     break;
                 }
@@ -668,6 +672,7 @@ mod tests_h2 {
             send_req.clone(),
             closed_rx,
             ping_timeout,
+            None,
             0,
             1,
             digest,
