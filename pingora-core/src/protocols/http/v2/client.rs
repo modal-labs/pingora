@@ -20,7 +20,7 @@ use futures::FutureExt;
 use h2::client::{self, ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
 use http::HeaderMap;
-use log::{debug, error, warn};
+use log::{debug, warn};
 use pingora_error::{Error, ErrorType, ErrorType::*, OrErr, Result, RetryType};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
@@ -603,7 +603,7 @@ async fn do_ping_pong(
         debug!("H2 fd: {id} ping sent");
         match tokio::time::timeout(PING_TIMEOUT, ping_fut).await {
             Err(_) => {
-                error!("H2 fd: {id} ping timeout");
+                warn!("H2 fd: {id} ping timeout");
                 let _ = tx.send(());
                 break;
             }
@@ -617,7 +617,7 @@ async fn do_ping_pong(
                         // drive_connection() exits first, no need to error again
                         break;
                     }
-                    error!("H2 fd: {id} ping error: {e}");
+                    warn!("H2 fd: {id} ping error: {e}");
                     let _ = tx.send(());
                     break;
                 }
