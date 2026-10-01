@@ -44,6 +44,31 @@ impl Stub {
     }
 }
 
+// Decrements a stream counter on drop unless disarmed. spawn_stream() can be
+// cancelled while creating a stream; without this guard the increment would
+// leak and the connection would permanently appear busier than it is.
+struct StreamCounterGuard<'a>(Option<&'a AtomicUsize>);
+
+impl<'a> StreamCounterGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        Self(Some(counter))
+    }
+
+    // The stream was created: its slot is now owned by the Http2Session and
+    // released via release_stream().
+    fn disarm(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for StreamCounterGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(counter) = self.0 {
+            counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 pub(crate) struct ConnectionRefInner {
     connection_stub: Stub,
     closed: watch::Receiver<bool>,
@@ -172,20 +197,39 @@ impl ConnectionRef {
 
     // spawn a stream if more stream is allowed, otherwise return Ok(None)
     pub async fn spawn_stream(&self) -> Result<Option<Http2Session>> {
+        // Admit against the smaller of our configured limit and the limit the
+        // server currently advertises via SETTINGS_MAX_CONCURRENT_STREAMS.
+        // The advertised value is only known once the server's initial
+        // SETTINGS frame has been processed (until then h2 reports the
+        // client-side initial value), so it must be re-read on every
+        // admission rather than snapshotted at handshake: a server that
+        // advertises fewer streams than max_streams would otherwise have
+        // excess requests silently queued inside h2 — parked until a
+        // long-lived stream finishes — instead of signaling the caller to
+        // dial another connection.
+        let max_streams = self
+            .0
+            .max_streams
+            .min(self.0.connection_stub.0.current_max_send_streams());
         // Atomically check if the current_stream is over the limit
         // load(), compare and then fetch_add() cannot guarantee the same
         let current_streams = self.0.current_streams.fetch_add(1, Ordering::SeqCst);
-        if current_streams + self.pending_resets() >= self.0.max_streams {
+        if current_streams + self.pending_resets() >= max_streams {
             // already over the limit, reset the counter to the previous value
             self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
             return Ok(None);
         }
 
+        // Undo the increment above if stream creation fails or this future is
+        // cancelled while waiting.
+        let guard = StreamCounterGuard::new(&self.0.current_streams);
+
         match self.0.connection_stub.new_stream().await {
-            Ok(send_req) => Ok(Some(Http2Session::new(send_req, self.clone()))),
+            Ok(send_req) => {
+                guard.disarm();
+                Ok(Some(Http2Session::new(send_req, self.clone())))
+            }
             Err(e) => {
-                // fail to create the stream, reset the counter
-                self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
                 // Remote sends GOAWAY(NO_ERROR): graceful shutdown: this connection no longer
                 // accepts new streams. We can still try to create new connection.
                 if e.root_cause()
@@ -502,12 +546,15 @@ impl Connector {
 }
 
 // The h2 library we use has unbounded internal buffering, which will cause excessive memory
-// consumption when the downstream is slower than upstream. This window size caps the buffering by
-// limiting how much data can be inflight. However, setting this value will also cap the max
-// download speed by limiting the bandwidth-delay product of a link.
+// consumption when the downstream is slower than upstream. These window sizes cap the buffering by
+// limiting how much data can be inflight. However, they also cap the max download speed by
+// limiting the bandwidth-delay product of a link.
 // Long term, we should advertising large window but shrink it when a small buffer is full.
-// 8 Mbytes = 80 Mbytes X 100ms, which should be enough for most links.
-const H2_WINDOW_SIZE: u32 = 1 << 23;
+// The stream window caps buffering and throughput per response:
+// 1 Mbyte = 10 Mbytes/s X 100ms or 100 Mbytes/s X 10ms.
+// The connection window caps the total across all streams on the connection.
+const H2_CONNECTION_WINDOW_SIZE: u32 = 1 << 23;
+const H2_STREAM_WINDOW_SIZE: u32 = 1 << 20;
 
 pub async fn handshake(
     stream: Stream,
@@ -539,15 +586,15 @@ pub async fn handshake(
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
-        .initial_window_size(H2_WINDOW_SIZE)
-        // should this be max_streams * H2_WINDOW_SIZE?
-        .initial_connection_window_size(H2_WINDOW_SIZE)
+        .initial_window_size(H2_STREAM_WINDOW_SIZE)
+        // should this be max_streams * H2_STREAM_WINDOW_SIZE?
+        .initial_connection_window_size(H2_CONNECTION_WINDOW_SIZE)
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
     debug!("H2 handshake to server done.");
+    // Ping timeouts are observe-only (see drive_connection), so this never flips.
     let ping_timeout_occurred = Arc::new(AtomicBool::new(false));
-    let ping_timeout_clone = ping_timeout_occurred.clone();
     let max_allowed_streams = std::cmp::min(max_streams, connection.max_concurrent_send_streams());
 
     // Safe guard: new_http_session() assumes there should be at least one free stream
@@ -564,14 +611,7 @@ pub async fn handshake(
         .flatten();
 
     current_handle().spawn(async move {
-        drive_connection(
-            connection,
-            id,
-            closed_tx,
-            h2_ping_interval,
-            ping_timeout_clone,
-        )
-        .await;
+        drive_connection(connection, id, closed_tx, h2_ping_interval).await;
     });
     Ok(ConnectionRef::new(
         send_req,
@@ -639,6 +679,112 @@ mod tests {
             HttpSession::H2(_) => panic!("expect h1"),
             HttpSession::Custom(_) => panic!("expect h1"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_h2_admission_respects_server_advertised_max_streams() {
+        use tokio::net::TcpListener;
+
+        // An h2c server that advertises SETTINGS_MAX_CONCURRENT_STREAMS=1,
+        // like a gateway that wants at most one stream per connection.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut conn = h2::server::Builder::new()
+                        .max_concurrent_streams(1)
+                        .handshake::<_, Bytes>(socket)
+                        .await
+                        .unwrap();
+                    // Keep the connection alive while the first Pingora
+                    // session remains active.
+                    while (conn.accept().await).is_some() {}
+                });
+            }
+        });
+
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(addr, false, "".into());
+        peer.options.set_http_version(2, 2);
+        peer.options.max_h2_streams = 1024; // far above the server's limit
+
+        // The first stream is admitted before the server's SETTINGS is known.
+        let h2 = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
+        let h2_1 = match h2 {
+            HttpSession::H2(h2_stream) => h2_stream,
+            _ => panic!("expect h2"),
+        };
+
+        // Wait until the connection task has processed the server's initial
+        // SETTINGS rather than relying on scheduler timing.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while h2_1.conn.0.connection_stub.0.current_max_send_streams() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server SETTINGS was not processed");
+
+        // 1023 configured slots remain, but the server allows one concurrent
+        // stream: the connector must report "no free stream" so the caller
+        // dials a new connection, not queue the request inside h2 behind the
+        // live stream.
+        let reused = connector.reused_http_session(&peer).await.unwrap();
+        assert!(reused.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_h2_ping_timeout_keeps_connection_open() {
+        use http::{Response, StatusCode};
+        use tokio::net::TcpListener;
+        use tokio::sync::oneshot;
+
+        // An h2c server that accepts one stream and then stops polling its
+        // connection, so pings go unacked, until the test resumes it.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stalled_tx, stalled_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = h2::server::handshake(socket).await.unwrap();
+            let (_req, respond) = conn.accept().await.unwrap().unwrap();
+            let _ = stalled_tx.send((conn, respond));
+        });
+
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(addr, false, "".into());
+        peer.options.set_http_version(2, 2);
+        peer.options.h2_ping_interval = Some(Duration::from_millis(100));
+
+        let mut h2 = match connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap()
+        {
+            HttpSession::H2(h2_stream) => h2_stream,
+            _ => panic!("expect h2"),
+        };
+        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2.write_request_header(Box::new(req), true).unwrap();
+        let (mut server_conn, mut respond) = stalled_rx.await.unwrap();
+
+        // Past the 5s ping timeout, the connection is still open and usable.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!h2.conn().is_closed());
+        assert!(!h2.ping_timedout());
+
+        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+        respond.send_response(resp, true).unwrap();
+        tokio::spawn(async move { while server_conn.accept().await.is_some() {} });
+        h2.read_response_header().await.unwrap();
+        assert_eq!(h2.response_header().unwrap().status, StatusCode::OK);
     }
 
     #[tokio::test]

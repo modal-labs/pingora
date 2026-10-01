@@ -30,6 +30,9 @@ use std::task::ready;
 use std::time::Duration;
 
 use crate::protocols::http::body_buffer::FixedBuffer;
+use crate::protocols::http::body_fork::{
+    body_multi_fork_pair_with, BodyForkReceiver, BodyMultiForkSender,
+};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
@@ -109,6 +112,8 @@ pub struct HttpSession {
     pub write_timeout: Option<Duration>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
+    /// Optional lossy tee of request body bytes (see [`Self::attach_request_body_fork`]).
+    body_fork: Option<BodyMultiForkSender>,
 }
 
 impl HttpSession {
@@ -150,6 +155,7 @@ impl HttpSession {
                 digest,
                 write_timeout: None,
                 total_drain_timeout: None,
+                body_fork: None,
             }
         }))
     }
@@ -173,21 +179,45 @@ impl HttpSession {
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
+        match self.request_body_reader.data().await.transpose().or_err(
             ErrorType::ReadError,
             "while reading downstream request body",
-        )?;
-        if let Some(data) = data.as_ref() {
-            self.body_read += data.len();
-            if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(data);
+        ) {
+            Ok(Some(ref data)) => {
+                self.body_read += data.len();
+                if let Some(buffer) = self.retry_buffer.as_mut() {
+                    buffer.write_to_buffer(data);
+                }
+                if let Some(ref tx) = self.body_fork {
+                    if tx.try_push(data.clone()).is_err() {
+                        self.body_fork = None; // abort: drop sender
+                    }
+                }
+                if self.request_body_reader.is_end_stream() {
+                    // Finish the fork immediately if finished,
+                    // rather than wait for another poll to return EOF.
+                    // This is valuable for smaller requests where the body is read in a single poll.
+                    if let Some(tx) = self.body_fork.take() {
+                        tx.finish();
+                    }
+                }
+                let _ = self
+                    .request_body_reader
+                    .flow_control()
+                    .release_capacity(data.len());
+                Ok(Some(data.clone()))
             }
-            let _ = self
-                .request_body_reader
-                .flow_control()
-                .release_capacity(data.len());
+            Ok(None) => {
+                if let Some(tx) = self.body_fork.take() {
+                    tx.finish(); // clean EOF: preserve buffered bytes
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                self.body_fork = None; // abort: drop clears buffered bytes
+                Err(e)
+            }
         }
-        Ok(data)
     }
 
     #[doc(hidden)]
@@ -219,6 +249,32 @@ impl HttpSession {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Attach a bounded lossy fork with an owned-chunk mapper.
+    ///
+    /// Returns [`None`] if a fork is already attached. Call before the first
+    /// [`Self::read_body_bytes`]. See
+    /// [`crate::protocols::http::v1::server::HttpSession::attach_request_body_fork_with`] for
+    /// semantics.
+    ///
+    /// The mapper runs for every forked chunk before queue admission. Returning [`None`] aborts
+    /// only the fork; the primary request continues with its original chunk.
+    pub fn attach_request_body_multi_fork_with<F>(
+        &mut self,
+        max_chunks: usize,
+        forks: usize,
+        mapper: F,
+    ) -> Option<Vec<BodyForkReceiver>>
+    where
+        F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    {
+        if self.body_fork.is_some() {
+            return None;
+        }
+        let (tx, rx) = body_multi_fork_pair_with(max_chunks, forks, mapper);
+        self.body_fork = Some(tx);
+        Some(rx)
     }
 
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
@@ -489,10 +545,38 @@ impl HttpSession {
         self.send_response_body.take()
     }
 
-    // This is a hack for pingora-proxy to create subrequests from h2 server session
-    // TODO: be able to convert from h2 to h1 subrequest
+    /// Serialize the H2 request header as HTTP/1.1 wire bytes for subrequest
+    /// use.  Applies the same H2→H1 conversions as `proxy_h1.rs`:
+    ///
+    /// 1. Force version to HTTP/1.1 (H1 parser rejects "HTTP/2")
+    /// 2. Add `Host` header from `:authority` if absent (H2 uses `:authority`,
+    ///    most H1 servers expect `Host`)
+    /// 3. Add `Transfer-Encoding: chunked` if there is a body but no
+    ///    `Content-Length` (H2 uses its own framing; H1 needs an explicit
+    ///    body-length signal)
     pub fn pseudo_raw_h1_request_header(&self) -> Bytes {
-        let buf = http_req_header_to_wire(&self.request_header).unwrap(); // safe, None only when version unknown
+        let mut header = self.request_header.clone();
+        header.set_version(http::Version::HTTP_11);
+
+        // H2 uses :authority instead of Host; add Host for H1 compatibility.
+        if !header.headers.contains_key(http::header::HOST) {
+            let host = header.uri.authority().map_or("", |a| a.as_str()).to_owned();
+            header
+                .insert_header(http::header::HOST, host)
+                .expect("valid host header");
+        }
+
+        // H2 has its own framing; H1 needs Content-Length or chunked encoding.
+        if self.body_read == 0
+            && !self.is_body_empty()
+            && !header.headers.contains_key(http::header::CONTENT_LENGTH)
+        {
+            header
+                .insert_header(http::header::TRANSFER_ENCODING, "chunked")
+                .expect("valid TE header");
+        }
+
+        let buf = http_req_header_to_wire(&header).unwrap(); // safe, None only when version unknown
         buf.freeze()
     }
 
@@ -594,6 +678,62 @@ mod test {
     use super::*;
     use http::{HeaderValue, Method, Request};
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn body_fork_finishes_after_final_nonempty_read() {
+        let (client, server) = duplex(65536);
+        let client_task = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let response = {
+                let mut h2 = h2.ready().await.unwrap();
+                let (response, mut body) = h2.send_request(request, false).unwrap();
+                body.send_data(Bytes::from_static(b"abc"), true).unwrap();
+                response
+            };
+            assert_eq!(response.await.unwrap().status(), 200);
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let mut http = HttpSession::from_h2_conn(&mut connection, Arc::new(Digest::default()))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut forks = http
+            .attach_request_body_multi_fork_with(1, 1, Some)
+            .unwrap();
+        let mut fork = forks.pop().expect("expected one fork");
+
+        let body = http.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body, b"abc".as_slice());
+
+        let chunks = fork.recv().await.unwrap().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], b"abc".as_slice());
+        assert!(tokio::time::timeout(Duration::from_secs(1), fork.recv())
+            .await
+            .expect("body fork did not finish after the final nonempty read")
+            .unwrap()
+            .is_none());
+
+        let response = Box::new(ResponseHeader::build(200, None).unwrap());
+        http.write_response_header(response, true).unwrap();
+        drop(http);
+
+        let (_, client_result) = tokio::join!(
+            async { while connection.accept().await.is_some() {} },
+            client_task,
+        );
+        client_result.unwrap();
+    }
 
     #[tokio::test]
     async fn test_server_handshake_accept_request() {

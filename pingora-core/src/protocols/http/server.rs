@@ -14,9 +14,11 @@
 
 //! HTTP server session APIs
 
+use super::body_fork::BodyForkReceiver;
 use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
+use super::v1::client::http_req_header_to_wire;
 use super::v1::server::HttpSession as SessionV1;
 use super::v2::server::HttpSession as SessionV2;
 use super::HttpTask;
@@ -471,11 +473,20 @@ impl Session {
         }
     }
 
+    /// Serialize the request header into HTTP/1.x wire format.
+    ///
+    /// This serializes the parsed request header including any mutations
+    /// made by filters, rather than the raw bytes as read from the wire.
+    /// Whitespace is normalized.
     pub fn to_h1_raw(&self) -> Bytes {
         match self {
-            Self::H1(s) => s.get_headers_raw_bytes(),
+            Self::H1(s) => http_req_header_to_wire(s.req_header())
+                .expect("h1 request header always has a known version")
+                .freeze(),
             Self::H2(s) => s.pseudo_raw_h1_request_header(),
-            Self::Subrequest(s) => s.get_headers_raw_bytes(),
+            Self::Subrequest(s) => http_req_header_to_wire(s.req_header())
+                .expect("subrequest header always has a known version")
+                .freeze(),
             Self::Custom(c) => c.pseudo_raw_h1_request_header(),
         }
     }
@@ -588,6 +599,26 @@ impl Session {
         }
     }
 
+    /// Attach a bounded lossy fork with an owned-chunk mapper (HTTP/1 and HTTP/2 only).
+    ///
+    /// Returns [`None`] for subrequest/custom sessions or if a fork is already attached on the
+    /// underlying session. See [`SessionV1::attach_request_body_fork_with`].
+    pub fn attach_request_body_multi_fork_with<F>(
+        &mut self,
+        max_chunks: usize,
+        forks: usize,
+        mapper: F,
+    ) -> Option<Vec<BodyForkReceiver>>
+    where
+        F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    {
+        match self {
+            Self::H1(s) => s.attach_request_body_multi_fork_with(max_chunks, forks, mapper),
+            Self::H2(s) => s.attach_request_body_multi_fork_with(max_chunks, forks, mapper),
+            Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),
@@ -605,6 +636,18 @@ impl Session {
             Self::H2(s) => s.read_body_or_idle(no_body_expected).await,
             Self::Subrequest(s) => s.read_body_or_idle(no_body_expected).await,
             Self::Custom(s) => s.read_body_or_idle(no_body_expected).await,
+        }
+    }
+
+    /// Wait for the client to abort this stream without reading any body data.
+    ///
+    /// For HTTP/2 this resolves when the client resets the stream (RST_STREAM) or the
+    /// stream errors. Other protocols have no out-of-band abort signal (detecting a
+    /// close would require consuming reads), so this future is pending forever for them.
+    pub async fn watch_h2_stream_reset(&mut self) -> Result<h2::Reason> {
+        match self {
+            Self::H2(s) => s.idle().await,
+            Self::H1(_) | Self::Subrequest(_) | Self::Custom(_) => std::future::pending().await,
         }
     }
 

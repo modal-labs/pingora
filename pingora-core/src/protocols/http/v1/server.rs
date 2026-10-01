@@ -32,7 +32,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask};
+use crate::protocols::http::body_fork::{body_multi_fork_pair_with, BodyMultiForkSender};
+use crate::protocols::http::{
+    body_buffer::FixedBuffer, body_fork::BodyForkReceiver, date, HttpTask,
+};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -86,6 +89,8 @@ pub struct HttpSession {
     /// Number of times the upstream connection associated with this session can be reused
     /// after this session ends
     keepalive_reuses_remaining: Option<u32>,
+    /// Optional lossy tee of request body bytes (see [`Self::attach_request_body_fork`]).
+    body_fork: Option<BodyMultiForkSender>,
 }
 
 impl HttpSession {
@@ -126,6 +131,7 @@ impl HttpSession {
             // default on to avoid rejecting requests after body as pipelined
             close_on_response_before_downstream_finish: true,
             keepalive_reuses_remaining: None,
+            body_fork: None,
         }
     }
 
@@ -424,15 +430,65 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body().await?;
-        Ok(read.map(|b| {
-            let bytes = Bytes::copy_from_slice(self.get_body(&b));
-            self.body_bytes_read += bytes.len();
-            if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(&bytes);
+        let read = self.read_body().await;
+        match read {
+            Ok(Some(b)) => {
+                let bytes = Bytes::copy_from_slice(self.get_body(&b));
+                self.body_bytes_read += bytes.len();
+                if let Some(buffer) = self.retry_buffer.as_mut() {
+                    buffer.write_to_buffer(&bytes);
+                }
+                if let Some(ref tx) = self.body_fork {
+                    if tx.try_push(bytes.clone()).is_err() {
+                        self.body_fork = None; // abort: drop sender
+                    }
+                }
+                if self.body_reader.body_done() {
+                    // Finish the fork immediately if finished,
+                    // rather than wait for another poll to return EOF.
+                    // This is valuable for smaller requests where the body is read in a single poll.
+                    if let Some(tx) = self.body_fork.take() {
+                        tx.finish();
+                    }
+                }
+                Ok(Some(bytes))
             }
-            bytes
-        }))
+            Ok(None) => {
+                if let Some(tx) = self.body_fork.take() {
+                    tx.finish(); // clean EOF: preserve buffered bytes
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                self.body_fork = None; // abort: drop clears buffered bytes
+                Err(e)
+            }
+        }
+    }
+
+    /// Attach a bounded lossy fork with an owned-chunk mapper.
+    ///
+    /// Returns [`None`] if a fork is already attached. Call before the first
+    /// [`Self::read_body_bytes`]. Up to `max_chunks` chunks are queued; if
+    /// [`BodyForkSender::try_push`] fails, the fork sender is dropped and queued data is discarded.
+    ///
+    /// The mapper runs for every forked chunk before queue admission. Returning [`None`] aborts
+    /// only the fork; the primary request continues with its original chunk.
+    pub fn attach_request_body_multi_fork_with<F>(
+        &mut self,
+        max_chunks: usize,
+        forks: usize,
+        mapper: F,
+    ) -> Option<Vec<BodyForkReceiver>>
+    where
+        F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    {
+        if self.body_fork.is_some() {
+            return None;
+        }
+        let (tx, rx) = body_multi_fork_pair_with(max_chunks, forks, mapper);
+        self.body_fork = Some(tx);
+        Some(rx)
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -1424,6 +1480,30 @@ mod tests_stream {
         assert_eq!(res, input3.as_slice());
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
         assert_eq!(http_stream.body_bytes_read(), 3);
+    }
+
+    #[tokio::test]
+    async fn body_fork_finishes_after_final_nonempty_read() {
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let mut forks = http_stream
+            .attach_request_body_multi_fork_with(1, 1, Some)
+            .unwrap();
+        let mut fork = forks.pop().expect("expected one fork");
+
+        let body = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body, b"abc".as_slice());
+
+        let chunks = fork.recv().await.unwrap().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], b"abc".as_slice());
+        assert!(tokio::time::timeout(Duration::from_secs(1), fork.recv())
+            .await
+            .expect("body fork did not finish after the final nonempty read")
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -880,6 +880,43 @@ impl UniqueID for HttpSession {
     }
 }
 
+/// Verify that `http_req_header_to_wire` preserves the request version in the
+/// request line.  This is important because `pseudo_raw_h1_request_header` on
+/// the H2 server session must override the version to HTTP/1.1 before calling
+/// this function — otherwise the H1 parser rejects "HTTP/2".
+#[cfg(test)]
+mod tests_req_header_to_wire {
+    use super::*;
+    use pingora_http::RequestHeader;
+
+    #[test]
+    fn http2_version_emits_http2_verbatim() {
+        let mut header = RequestHeader::build("GET", b"/test", None).unwrap();
+        header.set_version(http::Version::HTTP_2);
+        let wire = http_req_header_to_wire(&header).unwrap();
+        let line = std::str::from_utf8(&wire).unwrap();
+        assert!(
+            line.starts_with("GET /test HTTP/2\r\n"),
+            "HTTP/2 version should be emitted verbatim: {line}"
+        );
+    }
+
+    #[test]
+    fn http11_override_emits_http11() {
+        // Simulates what pseudo_raw_h1_request_header does: clone + set_version.
+        let mut header = RequestHeader::build("POST", b"/mirror", None).unwrap();
+        header.set_version(http::Version::HTTP_2);
+        // Override to HTTP/1.1 (as pseudo_raw_h1_request_header should do).
+        header.set_version(http::Version::HTTP_11);
+        let wire = http_req_header_to_wire(&header).unwrap();
+        let line = std::str::from_utf8(&wire).unwrap();
+        assert!(
+            line.starts_with("POST /mirror HTTP/1.1\r\n"),
+            "overridden version should produce HTTP/1.1: {line}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests_stream {
     use super::*;
