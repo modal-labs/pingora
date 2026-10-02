@@ -55,14 +55,21 @@ pub struct Http2Session {
     pub conn: ConnectionRef,
     // Indicate that whether a END_STREAM is already sent
     ended: bool,
+    // The connection's frames_read() when the request was sent, see Drop
+    frames_read_at_send: u64,
     // Total DATA payload bytes received from upstream response
     body_recv: usize,
 }
 
 impl Drop for Http2Session {
     fn drop(&mut self) {
-        // h2 sends RST_STREAM when dropping a stream whose response hasn't finished
-        if self.req_sent.is_some() && !self.response_finished() {
+        // h2 sends RST_STREAM when dropping a stream whose response hasn't finished. Unless the
+        // peer sent any frame since this request went out, the connection may be hung, so hold
+        // the slot until the peer acks a ping.
+        if self.req_sent.is_some()
+            && !self.response_finished()
+            && self.conn.frames_read() == self.frames_read_at_send
+        {
             self.conn.record_pending_reset();
         }
         self.conn.release_stream();
@@ -82,6 +89,7 @@ impl Http2Session {
             write_timeout: None,
             conn,
             ended: false,
+            frames_read_at_send: 0,
             body_recv: 0,
         }
     }
@@ -121,6 +129,7 @@ impl Http2Session {
         Self::sanitize_request_header(&mut req)?;
         let parts = req.as_owned_parts();
         let request = http::Request::from_parts(parts, ());
+        self.frames_read_at_send = self.conn.frames_read();
         // There is no write timeout for h2 because the actual write happens async from this fn
         let (resp_fut, send_body) = self
             .send_req
@@ -194,6 +203,10 @@ impl Http2Session {
                 .map_err(|e| self.handle_err(e))?,
             None => resp_fut.await,
         };
+        // Either way the peer sent a frame (HEADERS, or RST_STREAM / GOAWAY for remote errors)
+        if res.as_ref().map_or_else(|e| e.is_remote(), |_| true) {
+            self.conn.record_frame_read();
+        }
         let (resp, body_reader) = res.map_err(handle_read_header_error)?.into_parts();
         self.response_header = Some(resp.into());
         self.response_body_reader = Some(body_reader);
@@ -215,8 +228,16 @@ impl Http2Session {
         };
 
         let res = match resp_fut.poll_unpin(cx) {
-            Poll::Ready(Ok(res)) => res,
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Ok(res)) => {
+                self.conn.record_frame_read();
+                res
+            }
+            Poll::Ready(Err(err)) => {
+                if err.is_remote() {
+                    self.conn.record_frame_read();
+                }
+                return Poll::Ready(Err(err));
+            }
             Poll::Pending => {
                 self.resp_fut = Some(resp_fut);
                 return Poll::Pending;
@@ -247,6 +268,14 @@ impl Http2Session {
                 .map_err(|_| Error::explain(ReadTimedout, "while reading h2 response body"))?,
             None => fut.await,
         };
+        // DATA, end of stream, or a remote RST_STREAM / GOAWAY: the peer sent a frame
+        let peer_sent_frame = match &res {
+            Some(Err(e)) => e.is_remote(),
+            _ => true,
+        };
+        if peer_sent_frame {
+            self.conn.record_frame_read();
+        }
         let body = res
             .transpose()
             .or_err(ReadError, "while read h2 response body")
@@ -355,6 +384,10 @@ impl Http2Session {
                 .map_err(|e| self.handle_err(e))?,
             None => fut.await,
         };
+        // trailers, end of stream, or a remote RST_STREAM / GOAWAY: the peer sent a frame
+        if res.as_ref().map_or_else(|e| e.is_remote(), |_| true) {
+            self.conn.record_frame_read();
+        }
         match res {
             Ok(t) => Ok(t),
             Err(e) => {
