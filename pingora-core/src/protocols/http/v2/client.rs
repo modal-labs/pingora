@@ -203,9 +203,11 @@ impl Http2Session {
                 .map_err(|e| self.handle_err(e))?,
             None => resp_fut.await,
         };
-        // Either way the peer sent a frame (HEADERS, or RST_STREAM / GOAWAY for remote errors)
-        if res.as_ref().map_or_else(|e| e.is_remote(), |_| true) {
-            self.conn.record_frame_read();
+        // Either way the peer sent a frame: HEADERS, or RST_STREAM / GOAWAY for remote errors
+        match &res {
+            Ok(_) => self.conn.record_frame_read(true),
+            Err(e) if e.is_remote() => self.conn.record_frame_read(false),
+            Err(_) => {}
         }
         let (resp, body_reader) = res.map_err(handle_read_header_error)?.into_parts();
         self.response_header = Some(resp.into());
@@ -229,12 +231,12 @@ impl Http2Session {
 
         let res = match resp_fut.poll_unpin(cx) {
             Poll::Ready(Ok(res)) => {
-                self.conn.record_frame_read();
+                self.conn.record_frame_read(true);
                 res
             }
             Poll::Ready(Err(err)) => {
                 if err.is_remote() {
-                    self.conn.record_frame_read();
+                    self.conn.record_frame_read(false);
                 }
                 return Poll::Ready(Err(err));
             }
@@ -268,13 +270,11 @@ impl Http2Session {
                 .map_err(|_| Error::explain(ReadTimedout, "while reading h2 response body"))?,
             None => fut.await,
         };
-        // DATA, end of stream, or a remote RST_STREAM / GOAWAY: the peer sent a frame
-        let peer_sent_frame = match &res {
-            Some(Err(e)) => e.is_remote(),
-            _ => true,
-        };
-        if peer_sent_frame {
-            self.conn.record_frame_read();
+        match &res {
+            Some(Ok(_)) => self.conn.record_frame_read(true),
+            None => self.conn.record_frame_read(false),
+            Some(Err(e)) if e.is_remote() => self.conn.record_frame_read(false),
+            Some(Err(_)) => {}
         }
         let body = res
             .transpose()
@@ -384,9 +384,11 @@ impl Http2Session {
                 .map_err(|e| self.handle_err(e))?,
             None => fut.await,
         };
-        // trailers, end of stream, or a remote RST_STREAM / GOAWAY: the peer sent a frame
-        if res.as_ref().map_or_else(|e| e.is_remote(), |_| true) {
-            self.conn.record_frame_read();
+        match &res {
+            Ok(Some(_)) => self.conn.record_frame_read(true),
+            Ok(None) => self.conn.record_frame_read(false),
+            Err(e) if e.is_remote() => self.conn.record_frame_read(false),
+            Err(_) => {}
         }
         match res {
             Ok(t) => Ok(t),
