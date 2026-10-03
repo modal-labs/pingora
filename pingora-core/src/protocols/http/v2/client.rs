@@ -575,6 +575,7 @@ use tokio::sync::oneshot;
 pub async fn drive_connection<S>(
     mut c: client::Connection<S>,
     id: UniqueIDType,
+    peer_name: String,
     closed: watch::Sender<bool>,
     ping_interval: Option<Duration>,
 ) where
@@ -598,8 +599,8 @@ pub async fn drive_connection<S>(
 
         tokio::select! {
             r = &mut c => match r {
-                Ok(_) => debug!("H2 connection finished fd: {id}"),
-                Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
+                Ok(_) => debug!("H2 connection to {peer_name} finished fd: {id}"),
+                Err(e) => warn!("H2 connection to {peer_name} fd: {id} errored: {e}"),
             },
             r = rx => {
                 // Observe-only: a ping timeout is logged, but the connection
@@ -609,8 +610,8 @@ pub async fn drive_connection<S>(
                     Err(e) => warn!("H2 connection Ping Rx error {e:?}"),
                 }
                 match c.await {
-                    Ok(_) => debug!("H2 connection finished fd: {id}"),
-                    Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
+                    Ok(_) => debug!("H2 connection to {peer_name} finished fd: {id}"),
+                    Err(e) => warn!("H2 connection to {peer_name} fd: {id} errored: {e}"),
                 }
             },
         };
@@ -618,8 +619,8 @@ pub async fn drive_connection<S>(
         dropped.store(true, Ordering::Relaxed);
     } else {
         match c.await {
-            Ok(_) => debug!("H2 connection finished fd: {id}"),
-            Err(e) => debug!("H2 connection fd: {id} errored: {e:?}"),
+            Ok(_) => debug!("H2 connection to {peer_name} finished fd: {id}"),
+            Err(e) => warn!("H2 connection to {peer_name} fd: {id} errored: {e}"),
         }
     }
     let _ = closed.send(true);

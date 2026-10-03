@@ -431,7 +431,7 @@ impl Connector {
             }
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval(), peer.sni()).await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -578,6 +578,7 @@ pub async fn handshake(
     stream: Stream,
     max_streams: usize,
     h2_ping_interval: Option<Duration>,
+    peer_name: &str,
 ) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
@@ -628,8 +629,9 @@ pub async fn handshake(
     }
     let pending_resets_ping = connection.ping_pong();
 
+    let peer_name = peer_name.to_string();
     current_handle().spawn(async move {
-        drive_connection(connection, id, closed_tx, h2_ping_interval).await;
+        drive_connection(connection, id, peer_name, closed_tx, h2_ping_interval).await;
     });
     Ok(ConnectionRef::new(
         send_req,
@@ -923,7 +925,7 @@ mod tests {
     async fn test_h2_pending_resets_limit_unresponsive_conn() {
         // the server never reads anything, so our pings are never acked
         let (client_io, _server_io) = tokio::io::duplex(1 << 20);
-        let conn = handshake(Box::new(client_io), 3, None).await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
 
         for i in 0..3 {
             assert!(conn.more_streams_allowed());
@@ -960,7 +962,7 @@ mod tests {
                 pending.push(send_resp);
             }
         });
-        let conn = handshake(Box::new(client_io), 3, None).await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
 
         // a finished response doesn't count as a pending reset
         let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
@@ -1011,7 +1013,7 @@ mod tests {
                 }
             }
         });
-        let conn = handshake(Box::new(client_io), 3, None).await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
 
         // Send a request that will hang, then see the peer answer another request.
         let mut hung = conn.spawn_stream().await.unwrap().unwrap();
