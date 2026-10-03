@@ -69,6 +69,20 @@ impl Drop for StreamCounterGuard<'_> {
     }
 }
 
+// Canceled streams whose RST_STREAM the peer hasn't confirmed yet, see record_pending_reset()
+struct PendingResets {
+    ping: h2::PingPong,
+    // reset streams not yet confirmed by a pong, or by a later frame from the peer
+    count: usize,
+    // the connection's frames_read() when the last reset was recorded
+    frames_at_last_reset: u64,
+    // The connection's data_frames_read() when a reset ping was last acked, while the peer hasn't
+    // sent a HEADERS or DATA frame since. No more reset pings are sent until it does: gRPC
+    // servers only tolerate one ping between the frames they send (matches go's rstStreamPingsBlocked,
+    // see golang/go#70575).
+    pings_blocked_at: Option<u64>,
+}
+
 pub(crate) struct ConnectionRefInner {
     connection_stub: Stub,
     closed: watch::Receiver<bool>,
@@ -78,11 +92,13 @@ pub(crate) struct ConnectionRefInner {
     max_streams: usize,
     // how many concurrent streams already active
     current_streams: AtomicUsize,
-    // reset streams not yet confirmed by a PING ACK, see record_pending_reset()
-    pending_resets: Option<Mutex<(h2::PingPong, usize)>>,
-    // how many response frames (headers, data, trailers, resets) streams on this connection have
-    // observed, used to tell whether the peer showed signs of life since a request was sent
+    // reset streams not yet confirmed by the peer, see record_pending_reset()
+    pending_resets: Option<Mutex<PendingResets>>,
+    // how many frames (headers, data, trailers, resets) streams on this connection have observed
+    // from the peer, used to tell whether it showed signs of life since a request was sent
     frames_read: AtomicU64,
+    // like frames_read, but only HEADERS and DATA frames, see PendingResets::pings_blocked_at
+    data_frames_read: AtomicU64,
     // The connection is gracefully shutting down, no more stream is allowed
     shutting_down: AtomicBool,
     // because `SendRequest` doesn't actually have access to the underlying Stream,
@@ -112,8 +128,16 @@ impl ConnectionRef {
             id,
             max_streams,
             current_streams: AtomicUsize::new(0),
-            pending_resets: pending_resets_ping.map(|p| Mutex::new((p, 0))),
+            pending_resets: pending_resets_ping.map(|ping| {
+                Mutex::new(PendingResets {
+                    ping,
+                    count: 0,
+                    frames_at_last_reset: 0,
+                    pings_blocked_at: None,
+                })
+            }),
             frames_read: AtomicU64::new(0),
+            data_frames_read: AtomicU64::new(0),
             shutting_down: false.into(),
             digest,
             release_lock: Arc::new(Mutex::new(())),
@@ -144,16 +168,19 @@ impl ConnectionRef {
     /// sent (see [Http2Session]'s `Drop`): a peer that is still sending frames is responsive, so
     /// there is nothing to confirm and no PING to send.
     pub(crate) fn record_pending_reset(&self) {
-        if let Some(pending) = &self.0.pending_resets {
-            let (pending_resets_ping, count) = &mut *pending.lock();
-            Self::clear_confirmed_resets(pending_resets_ping, count);
-            if *count == 0 {
-                if let Err(e) = pending_resets_ping.send_ping(h2::Ping::opaque()) {
-                    debug!("H2 fd: {} pending reset ping failed: {e}", self.0.id);
-                }
-            }
-            *count += 1;
+        let Some(pending) = &self.0.pending_resets else {
+            return;
+        };
+        let p = &mut *pending.lock();
+        self.clear_confirmed_resets(p);
+        if p.count == 0 && !self.reset_pings_blocked(p) {
+            // This fails if a ping is still in flight (a frame already confirmed the resets it
+            // was sent for, and its pong confirms this one too) or if the connection is closed.
+            // Nothing to do in either case.
+            let _ = p.ping.send_ping(h2::Ping::opaque());
         }
+        p.count += 1;
+        p.frames_at_last_reset = self.frames_read();
     }
 
     /// The number of reset streams not yet confirmed by the peer
@@ -161,20 +188,32 @@ impl ConnectionRef {
         let Some(pending) = &self.0.pending_resets else {
             return 0;
         };
-        let (pending_resets_ping, count) = &mut *pending.lock();
-        Self::clear_confirmed_resets(pending_resets_ping, count);
-        *count
+        let p = &mut *pending.lock();
+        self.clear_confirmed_resets(p);
+        p.count
     }
 
-    // Reset `count` to 0 if the ping sent for the pending resets has been acked
-    fn clear_confirmed_resets(pending_resets_ping: &mut h2::PingPong, count: &mut usize) {
-        if *count == 0 {
+    // Clear the pending resets once the peer has proven it is alive, either by acking the
+    // ping sent for them or by sending any frame after the last one was recorded.
+    fn clear_confirmed_resets(&self, p: &mut PendingResets) {
+        // always consume pong
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let ponged = p.ping.poll_pong(&mut cx).is_ready();
+        if p.count == 0 {
             return;
         }
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        if pending_resets_ping.poll_pong(&mut cx).is_ready() {
-            *count = 0;
+        if ponged {
+            p.count = 0;
+            p.pings_blocked_at = Some(self.data_frames_read());
+        } else if self.frames_read() > p.frames_at_last_reset {
+            p.count = 0;
         }
+    }
+
+    // Whether reset pings are blocked, e.g. a reset ping was acked and the peer hasn't sent a HEADERS
+    // or DATA frame since, see PendingResets::pings_blocked_at
+    fn reset_pings_blocked(&self, p: &PendingResets) -> bool {
+        p.pings_blocked_at == Some(self.data_frames_read())
     }
 
     /// The number of response frames observed on this connection so far
@@ -182,9 +221,18 @@ impl ConnectionRef {
         self.0.frames_read.load(Ordering::Relaxed)
     }
 
-    /// Increment frames_read
-    pub(crate) fn record_frame_read(&self) {
+    /// The number of HEADERS and DATA frames observed on this connection so far
+    fn data_frames_read(&self) -> u64 {
+        self.0.data_frames_read.load(Ordering::Relaxed)
+    }
+
+    /// Record that a stream on this connection received a frame from the peer. `headers_or_data`
+    /// is true for a HEADERS (including trailers) or DATA frame, false for a RST_STREAM or GOAWAY.
+    pub(crate) fn record_frame_read(&self, headers_or_data: bool) {
         self.0.frames_read.fetch_add(1, Ordering::Relaxed);
+        if headers_or_data {
+            self.0.data_frames_read.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn id(&self) -> UniqueIDType {
@@ -1037,5 +1085,73 @@ mod tests {
             .unwrap();
         drop(hung);
         assert_eq!(conn.pending_resets(), 1);
+    }
+
+    // Cancel a request to `path` before it got any response.
+    async fn cancel_request(conn: &ConnectionRef, path: &str) {
+        let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
+        h2.write_request_header(test_request_path(path), true)
+            .unwrap();
+        drop(h2);
+    }
+
+    async fn wait_for_no_pending_resets(conn: &ConnectionRef) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while conn.pending_resets() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pending resets should be cleared");
+    }
+
+    #[tokio::test]
+    async fn test_h2_pending_resets_one_ping_until_peer_sends_frame() {
+        use http::{Response, StatusCode};
+
+        // A server that keeps acking pings, answers /respond, and hangs everything else.
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let mut hanging = vec![];
+            while let Some(result) = conn.accept().await {
+                let (req, mut send_resp) = result.unwrap();
+                if req.uri().path() == "/respond" {
+                    let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    let _ = send_resp.send_response(resp, true);
+                } else {
+                    hanging.push(send_resp);
+                }
+            }
+        });
+        let conn = handshake(Box::new(client_io), 10, None).await.unwrap();
+
+        // The first cancel sends a ping, which the server acks.
+        cancel_request(&conn, "/hang").await;
+        wait_for_no_pending_resets(&conn).await;
+
+        // Until the server sends a HEADERS or DATA frame, further cancels send no ping. They
+        // still count, so a connection that goes quiet and dies after the ack is not exempt.
+        // If a ping had been sent the (alive) server would have acked it and cleared the count.
+        cancel_request(&conn, "/hang").await;
+        cancel_request(&conn, "/hang").await;
+        assert_eq!(conn.pending_resets(), 2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(conn.pending_resets(), 2);
+
+        // A response frame from the server both confirms those resets and unblocks pings.
+        let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
+        h2.write_request_header(test_request_path("/respond"), true)
+            .unwrap();
+        h2.read_response_header().await.unwrap();
+        assert!(h2.read_response_body().await.unwrap().is_none());
+        drop(h2);
+        assert_eq!(conn.pending_resets(), 0);
+
+        // The next cancel pings again, and the ack clears it.
+        cancel_request(&conn, "/hang").await;
+        assert_eq!(conn.pending_resets(), 1);
+        wait_for_no_pending_resets(&conn).await;
+        assert!(conn.more_streams_allowed());
     }
 }
