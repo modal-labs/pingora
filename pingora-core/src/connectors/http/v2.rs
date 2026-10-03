@@ -22,12 +22,12 @@ use crate::upstreams::peer::{Peer, ALPN};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
-use log::debug;
+use log::{debug, error};
 use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -80,6 +80,9 @@ pub(crate) struct ConnectionRefInner {
     current_streams: AtomicUsize,
     // reset streams not yet confirmed by a PING ACK, see record_pending_reset()
     pending_resets: Option<Mutex<(h2::PingPong, usize)>>,
+    // how many response frames (headers, data, trailers, resets) streams on this connection have
+    // observed, used to tell whether the peer showed signs of life since a request was sent
+    frames_read: AtomicU64,
     // The connection is gracefully shutting down, no more stream is allowed
     shutting_down: AtomicBool,
     // because `SendRequest` doesn't actually have access to the underlying Stream,
@@ -110,6 +113,7 @@ impl ConnectionRef {
             max_streams,
             current_streams: AtomicUsize::new(0),
             pending_resets: pending_resets_ping.map(|p| Mutex::new((p, 0))),
+            frames_read: AtomicU64::new(0),
             shutting_down: false.into(),
             digest,
             release_lock: Arc::new(Mutex::new(())),
@@ -135,6 +139,10 @@ impl ConnectionRef {
     /// server acks a PING sent along with its RST_STREAM. So an unresponsive connection takes at
     /// most max_streams more requests, after which new requests go to a new connection.
     /// See <https://github.com/golang/net/commit/f35fec92ec9213ee211cf45f451a5970386f7978>
+    ///
+    /// Only called for a canceled stream that saw no frame from the peer since its request was
+    /// sent (see [Http2Session]'s `Drop`): a peer that is still sending frames is responsive, so
+    /// there is nothing to confirm and no PING to send.
     pub(crate) fn record_pending_reset(&self) {
         if let Some(pending) = &self.0.pending_resets {
             let (pending_resets_ping, count) = &mut *pending.lock();
@@ -167,6 +175,16 @@ impl ConnectionRef {
         if pending_resets_ping.poll_pong(&mut cx).is_ready() {
             *count = 0;
         }
+    }
+
+    /// The number of response frames observed on this connection so far
+    pub(crate) fn frames_read(&self) -> u64 {
+        self.0.frames_read.load(Ordering::Relaxed)
+    }
+
+    /// Increment frames_read
+    pub(crate) fn record_frame_read(&self) {
+        self.0.frames_read.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn id(&self) -> UniqueIDType {
@@ -413,7 +431,7 @@ impl Connector {
             }
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval()).await?;
+        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval(), peer.sni()).await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -560,6 +578,7 @@ pub async fn handshake(
     stream: Stream,
     max_streams: usize,
     h2_ping_interval: Option<Duration>,
+    peer_name: &str,
 ) -> Result<ConnectionRef> {
     use h2::client::Builder;
     use pingora_runtime::current_handle;
@@ -604,14 +623,15 @@ pub async fn handshake(
     }
 
     let (closed_tx, closed_rx) = watch::channel(false);
-    assert!(
-        h2_ping_interval.is_none_or(|i| i.is_zero()),
-        "h2_ping_interval is currently incompatible with pending reset tracking"
-    );
+    if !h2_ping_interval.is_none_or(|i| i.is_zero()) {
+        error!("h2_ping_interval is incompatible with pending reset tracking, exiting");
+        std::process::exit(1);
+    }
     let pending_resets_ping = connection.ping_pong();
 
+    let peer_name = peer_name.to_string();
     current_handle().spawn(async move {
-        drive_connection(connection, id, closed_tx, h2_ping_interval).await;
+        drive_connection(connection, id, peer_name, closed_tx, h2_ping_interval).await;
     });
     Ok(ConnectionRef::new(
         send_req,
@@ -891,7 +911,11 @@ mod tests {
     }
 
     fn test_request() -> Box<pingora_http::RequestHeader> {
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        test_request_path("/")
+    }
+
+    fn test_request_path(path: &str) -> Box<pingora_http::RequestHeader> {
+        let mut req = pingora_http::RequestHeader::build("GET", path.as_bytes(), None).unwrap();
         req.insert_header(http::header::HOST, "example.com")
             .unwrap();
         Box::new(req)
@@ -901,7 +925,7 @@ mod tests {
     async fn test_h2_pending_resets_limit_unresponsive_conn() {
         // the server never reads anything, so our pings are never acked
         let (client_io, _server_io) = tokio::io::duplex(1 << 20);
-        let conn = handshake(Box::new(client_io), 3, None).await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
 
         for i in 0..3 {
             assert!(conn.more_streams_allowed());
@@ -938,7 +962,7 @@ mod tests {
                 pending.push(send_resp);
             }
         });
-        let conn = handshake(Box::new(client_io), 3, None).await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
 
         // a finished response doesn't count as a pending reset
         let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
@@ -967,5 +991,51 @@ mod tests {
         assert!(!conn.is_closed());
         assert!(!conn.ping_timedout());
         assert!(conn.more_streams_allowed());
+    }
+
+    #[tokio::test]
+    async fn test_h2_pending_resets_skipped_when_peer_shows_life() {
+        use http::{Response, StatusCode};
+
+        // A server that answers requests to /respond and leaves everything else hanging.
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let mut hanging = vec![];
+            while let Some(result) = conn.accept().await {
+                let (req, mut send_resp) = result.unwrap();
+                if req.uri().path() == "/respond" {
+                    let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    // fails if the client already canceled the stream, which is fine
+                    let _ = send_resp.send_response(resp, true);
+                } else {
+                    hanging.push(send_resp);
+                }
+            }
+        });
+        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
+
+        // Send a request that will hang, then see the peer answer another request.
+        let mut hung = conn.spawn_stream().await.unwrap().unwrap();
+        hung.write_request_header(test_request_path("/hang"), true)
+            .unwrap();
+        let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
+        h2.write_request_header(test_request_path("/respond"), true)
+            .unwrap();
+        h2.read_response_header().await.unwrap();
+        assert!(h2.read_response_body().await.unwrap().is_none());
+        drop(h2);
+
+        // The peer sent frames since the hung request went out, so canceling it is not a
+        // pending reset: the connection is known to be alive and no ping is needed.
+        drop(hung);
+        assert_eq!(conn.pending_resets(), 0);
+
+        // A request canceled with no sign of life since it was sent still counts.
+        let mut hung = conn.spawn_stream().await.unwrap().unwrap();
+        hung.write_request_header(test_request_path("/hang"), true)
+            .unwrap();
+        drop(hung);
+        assert_eq!(conn.pending_resets(), 1);
     }
 }
