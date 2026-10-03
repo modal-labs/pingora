@@ -424,6 +424,8 @@ pub struct PeerOptions {
     pub tcp_keepalive: Option<TcpKeepalive>,
     pub tcp_recv_buf: Option<usize>,
     pub dscp: Option<u8>,
+    /// This is incompatible with the pending reset pings on our branch, and pending reset pings
+    /// will be disabled if this is set.
     pub h2_ping_interval: Option<Duration>,
     #[cfg(feature = "s2n")]
     pub psk: Option<Arc<PskType>>,

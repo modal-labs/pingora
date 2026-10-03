@@ -22,7 +22,7 @@ use crate::upstreams::peer::{Peer, ALPN};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
-use log::{debug, error};
+use log::{debug, warn};
 use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
@@ -623,11 +623,15 @@ pub async fn handshake(
     }
 
     let (closed_tx, closed_rx) = watch::channel(false);
-    if !h2_ping_interval.is_none_or(|i| i.is_zero()) {
-        error!("h2_ping_interval is incompatible with pending reset tracking, exiting");
-        std::process::exit(1);
-    }
-    let pending_resets_ping = connection.ping_pong();
+    let pending_resets_ping = if h2_ping_interval.is_none_or(|i| i.is_zero()) {
+        connection.ping_pong()
+    } else {
+        warn!(
+            "H2 fd: {id} peer {peer_name}: h2_ping_interval is set, \
+             pending reset tracking is disabled for this connection"
+        );
+        None
+    };
 
     let peer_name = peer_name.to_string();
     current_handle().spawn(async move {
