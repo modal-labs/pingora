@@ -22,7 +22,7 @@ use crate::upstreams::peer::{Peer, ALPN};
 
 use bytes::Bytes;
 use h2::client::SendRequest;
-use log::{debug, error};
+use log::{debug, warn};
 use parking_lot::{Mutex, RwLock};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_pool::{ConnectionMeta, ConnectionPool, PoolNode};
@@ -431,7 +431,14 @@ impl Connector {
             }
         }
         let max_h2_stream = peer.get_peer_options().map_or(1, |o| o.max_h2_streams);
-        let conn = handshake(stream, max_h2_stream, peer.h2_ping_interval(), peer.sni()).await?;
+        let conn = handshake(
+            stream,
+            max_h2_stream,
+            peer.h2_ping_interval(),
+            peer.h2_pending_resets(),
+            peer.sni(),
+        )
+        .await?;
         let h2_stream = conn
             .spawn_stream()
             .await?
@@ -578,6 +585,7 @@ pub async fn handshake(
     stream: Stream,
     max_streams: usize,
     h2_ping_interval: Option<Duration>,
+    pending_resets: bool,
     peer_name: &str,
 ) -> Result<ConnectionRef> {
     use h2::client::Builder;
@@ -623,11 +631,18 @@ pub async fn handshake(
     }
 
     let (closed_tx, closed_rx) = watch::channel(false);
-    if !h2_ping_interval.is_none_or(|i| i.is_zero()) {
-        error!("h2_ping_interval is incompatible with pending reset tracking, exiting");
-        std::process::exit(1);
-    }
-    let pending_resets_ping = connection.ping_pong();
+    // The periodic ping task, if any, owns the connection's PingPong, so the two can't coexist.
+    let pending_resets_ping = if !pending_resets {
+        None
+    } else if h2_ping_interval.is_none_or(|i| i.is_zero()) {
+        connection.ping_pong()
+    } else {
+        warn!(
+            "H2 fd: {id} peer {peer_name}: h2_ping_interval is set, \
+             pending reset tracking is disabled for this connection"
+        );
+        None
+    };
 
     let peer_name = peer_name.to_string();
     current_handle().spawn(async move {
@@ -925,7 +940,9 @@ mod tests {
     async fn test_h2_pending_resets_limit_unresponsive_conn() {
         // the server never reads anything, so our pings are never acked
         let (client_io, _server_io) = tokio::io::duplex(1 << 20);
-        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, true, "")
+            .await
+            .unwrap();
 
         for i in 0..3 {
             assert!(conn.more_streams_allowed());
@@ -942,6 +959,7 @@ mod tests {
         assert!(!conn.more_streams_allowed());
         assert!(conn.spawn_stream().await.unwrap().is_none());
     }
+
 
     #[tokio::test]
     async fn test_h2_pending_resets_cleared_by_ping_ack() {
@@ -962,7 +980,9 @@ mod tests {
                 pending.push(send_resp);
             }
         });
-        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, true, "")
+            .await
+            .unwrap();
 
         // a finished response doesn't count as a pending reset
         let mut h2 = conn.spawn_stream().await.unwrap().unwrap();
@@ -1013,7 +1033,9 @@ mod tests {
                 }
             }
         });
-        let conn = handshake(Box::new(client_io), 3, None, "").await.unwrap();
+        let conn = handshake(Box::new(client_io), 3, None, true, "")
+            .await
+            .unwrap();
 
         // Send a request that will hang, then see the peer answer another request.
         let mut hung = conn.spawn_stream().await.unwrap().unwrap();

@@ -111,9 +111,10 @@ mod test {
 
         // Client
         handles.push(tokio::spawn(async move {
-            let conn = crate::connectors::http::v2::handshake(Box::new(client), 500, None, "")
-                .await
-                .unwrap();
+            let conn =
+                crate::connectors::http::v2::handshake(Box::new(client), 500, None, false, "")
+                    .await
+                    .unwrap();
 
             let mut h2_stream = conn.spawn_stream().await.unwrap().unwrap();
             h2_stream.write_timeout = Some(Duration::from_millis(100));
