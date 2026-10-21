@@ -38,7 +38,8 @@ use pingora_runtime::current_handle;
 use pingora_timeout::timeout;
 use std::fs::Permissions;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio_util::task::TaskTracker;
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
 pub struct Service<A> {
@@ -185,6 +186,7 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
         app_logic: Arc<A>,
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
+        connections: TaskTracker,
     ) {
         // the accept loop, until the system is shutting down
         loop {
@@ -211,7 +213,7 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                 Ok(io) => {
                     let app = app_logic.clone();
                     let shutdown = shutdown.clone();
-                    current_handle().spawn(async move {
+                    let connection = async move {
                         let peer_addr = io.peer_addr();
                         match timeout(Duration::from_secs(60), io.handshake()).await {
                             Ok(handshake) => {
@@ -231,7 +233,8 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                                 error!("Downstream handshake timeout");
                             }
                         }
-                    });
+                    };
+                    connections.spawn_on(connection, &current_handle());
                 }
                 Err(e) => {
                     error!("Accept() failed {e}");
@@ -281,15 +284,18 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         let app_logic = Arc::new(app_logic);
 
         let mut handlers = Vec::new();
+        // Tracks the connection tasks so that this service only exits once they are all done.
+        let connections = TaskTracker::new();
 
         endpoints.into_iter().for_each(|endpoint| {
             for _ in 0..listeners_per_fd {
                 let shutdown = shutdown.clone();
                 let my_app_logic = app_logic.clone();
                 let endpoint = endpoint.clone();
+                let connections = connections.clone();
 
                 let jh = runtime.spawn(async move {
-                    Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
+                    Self::run_endpoint(my_app_logic, endpoint, shutdown, connections).await;
                 });
 
                 handlers.push(jh);
@@ -298,7 +304,22 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
 
         futures::future::join_all(handlers).await;
         self.listeners.cleanup();
+        // Lets the app drop idle (keepalive) connections so that only connections with a
+        // request in flight remain.
         app_logic.cleanup().await;
+
+        // Only return once every accepted connection has finished, so that the server knows
+        // when this service has drained and can end the grace period early.
+        connections.close();
+        let active = connections.len();
+        let start = Instant::now();
+        connections.wait().await;
+        info!(
+            "Service {} drained {} active connection(s) in {:?}",
+            self.name,
+            active,
+            start.elapsed()
+        );
     }
 
     fn name(&self) -> &str {
