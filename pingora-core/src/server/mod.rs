@@ -53,9 +53,8 @@ pub use transfer_fd::Fds;
 
 use pingora_error::{Error, ErrorType, Result};
 
-/* Maximum time to wait for all services to exit before shutting down their runtimes.
-This is the graceful period for all existing sessions to finish. The wait ends as soon as
-every service has exited, so this is an upper bound rather than a fixed delay. */
+/* Maximum time to wait before exiting the program, providing a grace period 
+ all existing sessions to finish */
 const EXIT_TIMEOUT: u64 = 60 * 5;
 /* Time to wait before shutting down listening sockets.
 This is the graceful period for the new service to get ready */
@@ -779,7 +778,7 @@ impl Server {
                 .grace_period_seconds
                 .unwrap_or(EXIT_TIMEOUT);
             info!(
-                "Graceful shutdown: grace period of up to {}s starts, waiting for services to exit",
+                "Graceful shutdown: grace period of {}s starts, waiting for services to exit",
                 exit_timeout
             );
             let start = Instant::now();
@@ -793,7 +792,7 @@ impl Server {
             });
             if all_exited {
                 info!(
-                    "Graceful shutdown: all services exited after {:?}, grace period ends early",
+                    "Graceful shutdown: all services exited after {:?}",
                     start.elapsed()
                 );
             } else {

@@ -308,8 +308,7 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         // request in flight remain.
         app_logic.cleanup().await;
 
-        // Only return once every accepted connection has finished, so that the server knows
-        // when this service has drained and can end the grace period early.
+        // Only return once every accepted connection has finished.
         connections.close();
         let active = connections.len();
         let start = Instant::now();

@@ -17,9 +17,3 @@ Start the new instance with the `--upgrade` CLI option. The new instance will no
 Send SIGQUIT signal to the old instance. The old instance will start to transfer the listening socket to the new instance.
 
 Once step 2 is successful, the new instance will start to handle new incoming connections right away. Meanwhile, the old instance will enter its graceful shutdown mode. It waits a short period of time (to give the new instance time to initialize and prepare to handle traffic), after which it will not accept any new connections.
-
-## Grace period
-
-Both graceful shutdown (SIGTERM) and graceful upgrade (SIGQUIT) end with a grace period, configured by `grace_period_seconds` (default 5 minutes). Once the services are told to shut down, idle keepalive connections are closed and no new connections are accepted, but requests already in flight are allowed to finish. The server exits as soon as every service has drained, so a server with no in-flight requests exits right away; the grace period only bounds how long the server waits for slow requests. Requests still running when the grace period expires are interrupted during the final runtime shutdown, which is bounded by `graceful_shutdown_timeout_seconds`.
-
-A custom service should therefore only return from `start_service()` once its in-flight work is done, otherwise the server may consider it drained early.
