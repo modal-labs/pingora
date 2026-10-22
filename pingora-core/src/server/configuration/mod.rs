@@ -75,9 +75,7 @@ pub struct ServerConf {
     /// WARNING: Disabling the s2n config cache can result in poor performance
     #[cfg(feature = "s2n")]
     pub s2n_config_cache_size: Option<usize>,
-    /// Maximum grace period in seconds between signaling shutdown and starting the final step of
-    /// the graceful shutdown. The grace period ends early once every service has exited, i.e.
-    /// once all in-flight requests have finished.
+    /// Grace period in seconds before starting the final step of the graceful shutdown after signaling shutdown.
     pub grace_period_seconds: Option<u64>,
     /// Timeout in seconds of the final step for the graceful shutdown.
     pub graceful_shutdown_timeout_seconds: Option<u64>,
