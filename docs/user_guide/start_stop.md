@@ -21,7 +21,7 @@ A Pingora server will listen to the following signals.
 Upon receiving SIGINT (ctrl + c), the server will exit immediately with no delay. All unfinished requests will be interrupted. This behavior is usually less preferred because it could break requests.
 
 ### SIGTERM: graceful shutdown
-Upon receiving SIGTERM, the server will notify all its services to shutdown, wait for some preconfigured time and then exit. This behavior gives requests a grace period to finish.
+Upon receiving SIGTERM, the server will notify all its services to shutdown, wait for up to some preconfigured time and then exit. This behavior gives requests a grace period to finish.
 
 ### SIGQUIT: graceful upgrade
 Similar to SIGTERM, but the server will also transfer all its listening sockets to a new Pingora server so that there is no downtime during the upgrade. See the [graceful upgrade](graceful.md) section for more details.

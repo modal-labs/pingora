@@ -33,10 +33,12 @@ use pingora_timeout::fast_timeout;
 use sentry::ClientOptions;
 use std::sync::Arc;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 #[cfg(unix)]
 use tokio::signal::unix;
 use tokio::sync::{broadcast, watch, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tokio::time::{sleep, Duration};
 
 use crate::prelude::background_service;
@@ -51,8 +53,8 @@ pub use transfer_fd::Fds;
 
 use pingora_error::{Error, ErrorType, Result};
 
-/* Time to wait before exiting the program.
-This is the graceful period for all existing sessions to finish */
+/* Maximum time to wait before exiting the program, providing a grace period 
+ all existing sessions to finish */
 const EXIT_TIMEOUT: u64 = 60 * 5;
 /* Time to wait before shutting down listening sockets.
 This is the graceful period for the new service to get ready */
@@ -378,13 +380,13 @@ impl Server {
         listeners_per_fd: usize,
         ready_notifier: ServiceReadyNotifier,
         dependency_watches: Vec<ServiceReadyWatch>,
-    ) -> Runtime
+    ) -> (Runtime, JoinHandle<()>)
 // NOTE: we need to keep the runtime outside async since
         // otherwise the runtime will be dropped.
     {
         let service_runtime = Server::create_runtime(service.name(), threads, work_stealing);
         let service_name = service.name().to_string();
-        service_runtime.get_handle().spawn(async move {
+        let service_task = service_runtime.get_handle().spawn(async move {
             // Wait for all dependencies to be ready
             let mut time_waited_opt: Option<Duration> = None;
             for mut watch in dependency_watches {
@@ -416,7 +418,7 @@ impl Server {
                 .await;
             info!("service '{}' exited.", service_name);
         });
-        service_runtime
+        (service_runtime, service_task)
     }
 
     /// Create a new [`Server`], using the [`Opt`] and [`ServerConf`] values provided
@@ -672,6 +674,7 @@ impl Server {
 
         // Holds tuples of runtimes and their service name.
         let mut runtimes: Vec<(Runtime, String)> = Vec::new();
+        let mut service_tasks: Vec<JoinHandle<()>> = Vec::new();
 
         // Get services in topological order (dependencies first)
         let startup_order = match self.dependencies.lock().topological_sort() {
@@ -733,7 +736,7 @@ impl Server {
                 .map(|s| s.ready_watch.clone())
                 .collect::<Vec<_>>();
 
-            let runtime = Server::run_service(
+            let (runtime, service_task) = Server::run_service(
                 wrapper.service,
                 #[cfg(unix)]
                 self.listen_fds(),
@@ -745,6 +748,7 @@ impl Server {
                 dependency_watches,
             );
             runtimes.push((runtime, name));
+            service_tasks.push(service_task);
         }
 
         // blocked on main loop so that it runs forever
@@ -773,9 +777,27 @@ impl Server {
                 .as_ref()
                 .grace_period_seconds
                 .unwrap_or(EXIT_TIMEOUT);
-            info!("Graceful shutdown: grace period {}s starts", exit_timeout);
-            thread::sleep(Duration::from_secs(exit_timeout));
-            info!("Graceful shutdown: grace period ends");
+            info!(
+                "Graceful shutdown: grace period of {}s starts, waiting for services to exit",
+                exit_timeout
+            );
+            let start = Instant::now();
+            let all_exited = server_runtime.get_handle().block_on(async {
+                timeout(
+                    Duration::from_secs(exit_timeout),
+                    futures::future::join_all(service_tasks),
+                )
+                .await
+                .is_ok()
+            });
+            if all_exited {
+                info!(
+                    "Graceful shutdown: all services exited after {:?}",
+                    start.elapsed()
+                );
+            } else {
+                info!("Graceful shutdown: grace period ends with services still running");
+            }
         }
 
         // Give tokio runtimes time to exit
@@ -799,7 +821,6 @@ impl Server {
                 info!("Waiting for runtimes to exit!");
                 let join = thread::spawn(move || {
                     rt.shutdown_timeout(shutdown_timeout);
-                    thread::sleep(shutdown_timeout)
                 });
                 (join, name)
             })
