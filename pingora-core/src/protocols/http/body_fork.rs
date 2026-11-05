@@ -26,6 +26,7 @@
 //!   Pending chunks are cleared immediately; [`BodyForkReceiver::recv`] reports the abort.
 
 use bytes::Bytes;
+use cadence::Counted;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -118,11 +119,27 @@ where
     )
 }
 
+fn record_fork_failure(reason: &str) {
+    // The global client is installed by the embedding binary.
+    if let Ok(client) = cadence_macros::get_global_default() {
+        let _ = client
+            .count_with_tags("flash_proxy.mirror.failure", 1)
+            .with_tag("mirror_request_type", "request_body")
+            .with_tag("reason", reason)
+            .try_send();
+    }
+}
+
 impl BodyMultiForkSender {
     /// Tries to push the same chunk of bytes to all forks, calling the mapping function once before pushing.
     pub fn try_push(&self, chunk: Bytes) -> Result<Vec<BodyForkPushError>, BodyMultiForkPushError> {
         let mut senders = self.senders.lock();
-        let chunk = (self.mapper)(chunk).ok_or(BodyMultiForkPushError::Rejected)?;
+        let chunk = (self.mapper)(chunk).ok_or_else(|| {
+            for _ in senders.iter() {
+                record_fork_failure("fork_rejected");
+            }
+            BodyMultiForkPushError::Rejected
+        })?;
         if chunk.is_empty() {
             return Ok(Vec::new());
         }
@@ -135,6 +152,9 @@ impl BodyMultiForkSender {
                 match res {
                     Ok(_) => Some(sender),
                     Err(e) => {
+                        if e == BodyForkPushError::Full {
+                            record_fork_failure("fork_full");
+                        }
                         errs.push(e);
                         None
                     }
