@@ -1652,7 +1652,7 @@ mod body_fork_tests {
 
     #[tokio::test(start_paused = true)]
     async fn eof_wait_on_stalled_pipeline_aborts_subrequest() {
-        let (body_tx, body_rx) = body_fork_pair_with(1);
+        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
         body_tx.try_push(Bytes::from_static(b"body")).unwrap();
         body_tx.finish();
 
@@ -1677,7 +1677,7 @@ mod body_fork_tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_body_send_on_finished_fork_aborts_subrequest() {
         let chunk_dropped = Arc::new(AtomicBool::new(false));
-        let (body_tx, body_rx) = body_fork_pair_with(1);
+        let (body_tx, body_rx) = body_fork_pair_with(1, Some);
         body_tx
             .try_push(Bytes::from_owner(TrackedChunk {
                 dropped: chunk_dropped.clone(),

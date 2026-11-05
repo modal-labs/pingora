@@ -603,26 +603,18 @@ impl Session {
     ///
     /// Returns [`None`] for subrequest/custom sessions or if a fork is already attached on the
     /// underlying session. See [`SessionV1::attach_request_body_fork_with`].
-    /// The observer is called once per fork dropped with a full queue, or once per
-    /// still-attached fork when the mapper rejects a chunk.
-    pub fn attach_request_body_multi_fork_with<F, O>(
+    pub fn attach_request_body_multi_fork_with<F>(
         &mut self,
         max_chunks: usize,
         forks: usize,
         mapper: F,
-        observer: O,
     ) -> Option<Vec<BodyForkReceiver>>
     where
         F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
-        O: Fn(crate::protocols::http::body_fork::BodyForkPushError) + Send + Sync + 'static,
     {
         match self {
-            Self::H1(s) => {
-                s.attach_request_body_multi_fork_with(max_chunks, forks, mapper, observer)
-            }
-            Self::H2(s) => {
-                s.attach_request_body_multi_fork_with(max_chunks, forks, mapper, observer)
-            }
+            Self::H1(s) => s.attach_request_body_multi_fork_with(max_chunks, forks, mapper),
+            Self::H2(s) => s.attach_request_body_multi_fork_with(max_chunks, forks, mapper),
             Self::Subrequest(_) | Self::Custom(_) => None,
         }
     }
