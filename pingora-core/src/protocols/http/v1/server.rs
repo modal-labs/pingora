@@ -474,19 +474,23 @@ impl HttpSession {
     ///
     /// The mapper runs for every forked chunk before queue admission. Returning [`None`] aborts
     /// only the fork; the primary request continues with its original chunk.
-    pub fn attach_request_body_multi_fork_with<F>(
+    /// The observer is called once per fork dropped with a full queue, or once per
+    /// still-attached fork when the mapper rejects a chunk.
+    pub fn attach_request_body_multi_fork_with<F, O>(
         &mut self,
         max_chunks: usize,
         forks: usize,
         mapper: F,
+        observer: O,
     ) -> Option<Vec<BodyForkReceiver>>
     where
         F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+        O: Fn(crate::protocols::http::body_fork::BodyForkPushError) + Send + Sync + 'static,
     {
         if self.body_fork.is_some() {
             return None;
         }
-        let (tx, rx) = body_multi_fork_pair_with(max_chunks, forks, mapper);
+        let (tx, rx) = body_multi_fork_pair_with(max_chunks, forks, mapper, observer);
         self.body_fork = Some(tx);
         Some(rx)
     }
@@ -1489,7 +1493,7 @@ mod tests_stream {
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         http_stream.read_request().await.unwrap();
         let mut forks = http_stream
-            .attach_request_body_multi_fork_with(1, 1, Some)
+            .attach_request_body_multi_fork_with(1, 1, Some, |_| {})
             .unwrap();
         let mut fork = forks.pop().expect("expected one fork");
 

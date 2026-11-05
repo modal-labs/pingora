@@ -77,6 +77,7 @@ pub struct BodyForkReceiver {
 
 pub struct BodyMultiForkSender {
     mapper: Box<dyn Fn(Bytes) -> Option<Bytes> + Send + Sync>,
+    observer: Box<dyn Fn(BodyForkPushError) + Send + Sync>,
     senders: Mutex<Vec<BodyForkSender>>,
 }
 
@@ -99,19 +100,26 @@ pub fn body_fork_pair_with(max_chunks: usize) -> (BodyForkSender, BodyForkReceiv
     )
 }
 
-pub fn body_multi_fork_pair_with<F>(
+/// Create bounded body forks with a shared mapper and a push-error observer.
+///
+/// The observer is called once per fork dropped because its queue is full, or once per
+/// still-attached fork when the mapper rejects a chunk.
+pub fn body_multi_fork_pair_with<F, O>(
     max_chunks: usize,
     forks: usize,
     mapper: F,
+    observer: O,
 ) -> (BodyMultiForkSender, Vec<BodyForkReceiver>)
 where
     F: Fn(Bytes) -> Option<Bytes> + Send + Sync + 'static,
+    O: Fn(BodyForkPushError) + Send + Sync + 'static,
 {
     assert!(forks > 0, "at least one fork is required");
     let (senders, receivers) = (0..forks).map(|_| body_fork_pair_with(max_chunks)).unzip();
     (
         BodyMultiForkSender {
             mapper: Box::new(mapper),
+            observer: Box::new(observer),
             senders: Mutex::new(senders),
         },
         receivers,
@@ -120,9 +128,15 @@ where
 
 impl BodyMultiForkSender {
     /// Tries to push the same chunk of bytes to all forks, calling the mapping function once before pushing.
+    /// Reports each failed fork to the configured observer.
     pub fn try_push(&self, chunk: Bytes) -> Result<Vec<BodyForkPushError>, BodyMultiForkPushError> {
         let mut senders = self.senders.lock();
-        let chunk = (self.mapper)(chunk).ok_or(BodyMultiForkPushError::Rejected)?;
+        let chunk = (self.mapper)(chunk).ok_or_else(|| {
+            for _ in senders.iter() {
+                (self.observer)(BodyForkPushError::Rejected);
+            }
+            BodyMultiForkPushError::Rejected
+        })?;
         if chunk.is_empty() {
             return Ok(Vec::new());
         }
@@ -135,6 +149,7 @@ impl BodyMultiForkSender {
                 match res {
                     Ok(_) => Some(sender),
                     Err(e) => {
+                        (self.observer)(e);
                         errs.push(e);
                         None
                     }
@@ -344,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_fork_partial_failure_keeps_healthy_fork() {
-        let (tx, mut receivers) = body_multi_fork_pair_with(1, 2, Some);
+        let (tx, mut receivers) = body_multi_fork_pair_with(1, 2, Some, |_| {});
         let mut healthy = receivers.remove(0);
         let mut stalled = receivers.remove(0);
 
@@ -364,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_fork_errors_when_last_healthy_fork_fails() {
-        let (tx, mut receivers) = body_multi_fork_pair_with(1, 2, Some);
+        let (tx, mut receivers) = body_multi_fork_pair_with(1, 2, Some, |_| {});
         let mut healthy = receivers.remove(0);
         let mut stalled = receivers.remove(0);
 
@@ -383,6 +398,46 @@ mod tests {
         );
         assert_eq!(healthy.recv().await, Err(BodyForkAborted));
         assert_eq!(stalled.recv().await, Err(BodyForkAborted));
+    }
+
+    #[test]
+    fn multi_fork_observes_each_full_queue() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let observed = errors.clone();
+        let (tx, _receivers) = body_multi_fork_pair_with(1, 2, Some, move |error| {
+            observed.lock().push(error);
+        });
+
+        assert_eq!(tx.try_push(Bytes::new()), Ok(vec![]));
+        assert_eq!(tx.try_push(Bytes::from_static(b"a")), Ok(vec![]));
+        assert!(errors.lock().is_empty());
+        assert_eq!(
+            tx.try_push(Bytes::from_static(b"b")),
+            Err(BodyMultiForkPushError::AllErrored(
+                vec![BodyForkPushError::Full; 2]
+            ))
+        );
+        assert_eq!(*errors.lock(), vec![BodyForkPushError::Full; 2]);
+    }
+
+    #[test]
+    fn multi_fork_observes_each_rejected_fork() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let observed = errors.clone();
+        let (tx, _receivers) = body_multi_fork_pair_with(
+            1,
+            2,
+            |_| None,
+            move |error| {
+                observed.lock().push(error);
+            },
+        );
+
+        assert_eq!(
+            tx.try_push(Bytes::from_static(b"a")),
+            Err(BodyMultiForkPushError::Rejected)
+        );
+        assert_eq!(*errors.lock(), vec![BodyForkPushError::Rejected; 2]);
     }
 
     struct TrackedBytes {
@@ -417,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn mapper_rejection_aborts_when_sender_is_dropped() {
-        let (tx, mut receivers) = body_multi_fork_pair_with(32, 1, |_| None);
+        let (tx, mut receivers) = body_multi_fork_pair_with(32, 1, |_| None, |_| {});
         let mut rx = receivers.pop().unwrap();
         assert_eq!(
             tx.try_push(Bytes::from_static(b"rejected")),
@@ -430,7 +485,8 @@ mod tests {
     #[tokio::test]
     async fn full_drops_failed_fork_bytes_immediately() {
         let live_bytes = Arc::new(AtomicUsize::new(0));
-        let (tx, mut rx_vec) = body_multi_fork_pair_with(1, 1, tracked_mapper(live_bytes.clone()));
+        let (tx, mut rx_vec) =
+            body_multi_fork_pair_with(1, 1, tracked_mapper(live_bytes.clone()), |_| {});
         let mut rx = rx_vec.pop().expect("expected one fork");
 
         tx.try_push(Bytes::from_static(b"a")).unwrap();
@@ -456,8 +512,12 @@ mod tests {
         const CHUNKS_PER_BATCH: usize = 32;
 
         let live_bytes = Arc::new(AtomicUsize::new(0));
-        let (tx, mut rx_vec) =
-            body_multi_fork_pair_with(CHUNKS_PER_BATCH, 1, tracked_mapper(live_bytes.clone()));
+        let (tx, mut rx_vec) = body_multi_fork_pair_with(
+            CHUNKS_PER_BATCH,
+            1,
+            tracked_mapper(live_bytes.clone()),
+            |_| {},
+        );
         let mut rx = rx_vec.pop().expect("expected one fork");
 
         for _ in 0..CHUNKS_PER_BATCH {
