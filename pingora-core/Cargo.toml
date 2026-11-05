@@ -36,6 +36,8 @@ futures = "0.3"
 async-trait = { workspace = true }
 httparse = { workspace = true }
 bytes = { workspace = true }
+cadence = "1"
+cadence-macros = "1"
 http = { workspace = true }
 log = { workspace = true }
 h2 = { workspace = true }
