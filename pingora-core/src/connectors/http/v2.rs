@@ -576,11 +576,11 @@ impl Connector {
 // limiting the bandwidth-delay product of a link.
 // Long term, we should advertising large window but shrink it when a small buffer is full.
 // The stream window caps buffering and throughput per response:
-// 512 Kbytes = 5 Mbytes/s X 100ms or 50 Mbytes/s X 10ms.
+// 2 Mbytes = 20 Mbytes/s X 100ms or 200 Mbytes/s X 10ms.
 // The connection window caps the total across all streams on the connection:
-// 4 Mbytes = 40 Mbytes/s X 100ms.
-const H2_CONNECTION_WINDOW_SIZE: u32 = 1 << 22;
-const H2_STREAM_WINDOW_SIZE: u32 = 1 << 19;
+// 16 Mbytes = 160 Mbytes/s X 100ms.
+const H2_CONNECTION_WINDOW_SIZE: u32 = 1 << 24;
+const H2_STREAM_WINDOW_SIZE: u32 = 1 << 21;
 
 pub async fn handshake(
     stream: Stream,
