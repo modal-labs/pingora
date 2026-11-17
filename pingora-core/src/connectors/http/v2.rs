@@ -500,6 +500,10 @@ pub async fn handshake(
         .initial_window_size(H2_WINDOW_SIZE)
         // should this be max_streams * H2_WINDOW_SIZE?
         .initial_connection_window_size(H2_WINDOW_SIZE)
+        // The upstream is trusted. Client cancels make late frames on already-reset
+        // streams count toward a lifetime per-connection reset cap; hitting it
+        // sends GOAWAY and kills unrelated in-flight streams.
+        .max_local_error_reset_streams(None)
         .handshake(stream)
         .await
         .or_err(HandshakeError, "during H2 handshake")?;
